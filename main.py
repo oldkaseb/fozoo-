@@ -7,7 +7,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 from sqlalchemy import create_engine, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey, Index
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, MessageHandler, CallbackQueryHandler, ChatMemberHandler,
@@ -24,7 +24,7 @@ AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "40"))
 
 Base = declarative_base()
 
-# ====== Persian Date/Time (fallback-safe) ======
+# ====== Persian Date/Time ======
 try:
     from persiantools.jdatetime import JalaliDateTime, JalaliDate
     from persiantools import digits as _digits
@@ -35,15 +35,12 @@ except Exception:
 def fa_digits(x: str) -> str:
     s = str(x)
     if HAS_PTOOLS:
-        try:
-            return _digits.en_to_fa(s)
-        except Exception:
-            return s
+        try: return _digits.en_to_fa(s)
+        except Exception: return s
     return s
 
 def fmt_dt_fa(dt_utc: Optional[dt.datetime], tz_name: Optional[str] = None) -> str:
-    if dt_utc is None:
-        return "-"
+    if dt_utc is None: return "-"
     tz = ZoneInfo(tz_name or DEFAULT_TZ)
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
@@ -53,19 +50,16 @@ def fmt_dt_fa(dt_utc: Optional[dt.datetime], tz_name: Optional[str] = None) -> s
             jdt = JalaliDateTime.fromgregorian(datetime=local)
             s = jdt.strftime("%Y/%m/%d %H:%M")
             return fa_digits(s) + f" ({tz.key.split('/')[-1]})"
-        except Exception:
-            pass
+        except Exception: ...
     return local.strftime("%Y/%m/%d %H:%M") + f" ({tz.key.split('/')[-1]})"
 
 def fmt_date_fa(d: Optional[dt.date]) -> str:
-    if not d:
-        return "-"
+    if not d: return "-"
     if HAS_PTOOLS:
         try:
             jd = JalaliDate.fromgregorian(date=d)
             return fa_digits(jd.strftime("%Y/%m/%d"))
-        except Exception:
-            pass
+        except Exception: ...
     return d.strftime("%Y/%m/%d")
 
 def today_jalali(tz: ZoneInfo) -> Tuple[int,int,int]:
@@ -83,8 +77,7 @@ def to_jalali_md(d: dt.date) -> Tuple[int,int]:
     return d.month, d.day
 
 def footer(text: str) -> str:
-    stamp = "— ساخته شده توسط تیم souls"
-    return f"{text}\n\n{stamp}"
+    return f"{text}\n\n— ساخته شده توسط تیم souls"
 
 def contact_kb(extra_rows: List[List[InlineKeyboardButton]]|None=None, bot_username: Optional[str]=None) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
@@ -94,20 +87,17 @@ def contact_kb(extra_rows: List[List[InlineKeyboardButton]]|None=None, bot_usern
         rows.append([InlineKeyboardButton("➕ افزودن ربات به گروه", url=f"https://t.me/{bot_username}?startgroup=true")])
     return InlineKeyboardMarkup(rows)
 
-# ====== Auto-Delete Helpers ======
+# ====== Auto-Delete ======
 async def _job_delete_message(context: ContextTypes.DEFAULT_TYPE):
     chat_id, msg_id = context.job.data
     try:
         await context.bot.delete_message(chat_id, msg_id)
-    except Exception:
-        pass
+    except Exception: ...
 
 def schedule_autodelete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, keep: bool=False):
-    if keep:
-        return
+    if keep: return
     jq = context.application.job_queue if hasattr(context, "application") else None
-    if jq:
-        jq.run_once(_job_delete_message, when=AUTO_DELETE_SECONDS, data=(chat_id, message_id))
+    if jq: jq.run_once(_job_delete_message, when=AUTO_DELETE_SECONDS, data=(chat_id, message_id))
 
 async def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                      reply_markup: InlineKeyboardMarkup|None=None, keep: bool=False,
@@ -123,7 +113,7 @@ def autodel_qmessage(context: ContextTypes.DEFAULT_TYPE, qmsg):
     if not qmsg: return
     schedule_autodelete(context, qmsg.chat.id, qmsg.message_id, keep=False)
 
-# ====== DB URL & DRIVER ======
+# ====== DB URL ======
 def _mask_url(u: str) -> str:
     try:
         parts = _up.urlsplit(u)
@@ -131,18 +121,15 @@ def _mask_url(u: str) -> str:
             netloc = parts.hostname or ""
             if parts.port: netloc += f":{parts.port}"
             return _up.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    except Exception:
-        pass
+    except Exception: ...
     return "<unparsable>"
 
 _DRIVER = None
 try:
-    import psycopg  # psycopg3
-    _DRIVER = "psycopg"
+    import psycopg; _DRIVER = "psycopg"
 except Exception:
     try:
-        import psycopg2
-        _DRIVER = "psycopg2"
+        import psycopg2; _DRIVER = "psycopg2"
     except Exception:
         _DRIVER = "psycopg"
 
@@ -282,10 +269,8 @@ with engine.begin() as conn:
 def try_send_owner(text_msg: str):
     from telegram import Bot
     if not TOKEN or not OWNER_ID: return
-    try:
-        Bot(TOKEN).send_message(OWNER_ID, footer(text_msg))
-    except Exception as e:
-        logging.info(f"Owner DM failed: {e}")
+    try: Bot(TOKEN).send_message(OWNER_ID, footer(text_msg))
+    except Exception as e: logging.info(f"Owner DM failed: {e}")
 
 def ensure_group(session, chat) -> 'Group':
     g = session.get(Group, chat.id)
@@ -323,12 +308,10 @@ def is_seller(session, tg_user_id: int) -> bool:
     return bool(s)
 
 def is_group_admin(session, chat_id: int, tg_user_id: int) -> bool:
-    if tg_user_id == OWNER_ID:
-        return True
+    if tg_user_id == OWNER_ID: return True
     g = session.get(Group, chat_id)
     blocked = (g.settings or {}).get("blocked_sellers", []) if g else []
-    if is_seller(session, tg_user_id) and tg_user_id not in blocked:
-        return True
+    if is_seller(session, tg_user_id) and tg_user_id not in blocked: return True
     row = session.execute(select(GroupAdmin).where(
         (GroupAdmin.chat_id==chat_id) & (GroupAdmin.tg_user_id==tg_user_id)
     )).scalar_one_or_none()
@@ -347,23 +330,20 @@ async def require_active_or_warn(update: Update, context: ContextTypes.DEFAULT_T
     schedule_autodelete(context, msg.chat_id, msg.message_id, keep=False)
     return False
 
-def clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
+def clean_text(s: str) -> str: return re.sub(r"\s+", " ", s.strip())
 
 def chunked(lst: List, n: int):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+    for i in range(0, len(lst), n): yield lst[i:i+n]
 
 def mention_of(u: 'User') -> str:
     if u.username: return f"@{u.username}"
     name = u.first_name or "کاربر"
     return f'<a href="tg://user?id={u.tg_user_id}">{name}</a>'
 
-# ====== STATE ======
+# ====== STATE/PATTERNS ======
 PENDING_REL: Dict[Tuple[int,int], Dict] = {}
 TAG_DELAY_SECONDS = 0.8
 
-# ====== PATTERNS ======
 PAT_GROUP = {
     "help": re.compile(r"^(?:فضول کمک|راهنما|کمک|فضول منو|منو)$"),
     "config": re.compile(r"^(?:پیکربندی فضول|فضول پیکربندی|فضول تنظیمات|تنظیمات فضول)$"),
@@ -371,7 +351,6 @@ PAT_GROUP = {
     "admin_del": re.compile(r"^حذف فضول ادمین(?: @?(\w+))?$"),
     "seller_block": re.compile(r"^(?:مسدود فروشنده)(?: @?(\w+))?$"),
     "seller_unblock": re.compile(r"^(?:آزاد فروشنده)(?: @?(\w+))?$"),
-
     "gender": re.compile(r"^ثبت جنسیت (دختر|پسر)$"),
     "birthday_set": re.compile(r"^ثبت تولد (\d{4}-\d{2}-\d{2})$"),
     "birthday_del": re.compile(r"^حذف تولد$"),
@@ -402,7 +381,7 @@ PAT_DM = {
     "list_sellers": re.compile(r"^لیست فروشنده‌ها$"),
 }
 
-# ====== UI BUILDERS ======
+# ====== UI ======
 def build_group_menu(is_group_admin_flag: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("👤 ثبت جنسیت", callback_data="ui:gset")],
@@ -452,12 +431,10 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid == OWNER_ID:
             txt = (
                 "👑 «راهنمای مالک»\n"
-                "• مدیریت گروه‌ها: «📋 لیست گروه‌ها» → پنل گروه (شارژ/تمدید/انقضا/خروج/افزودن).\n"
-                "• مدیریت فروشنده‌ها: «🛍️ لیست فروشنده‌ها» → آمار/عزل. افزودن: «افزودن فروشنده <tg_user_id> [یادداشت]».\n"
-                "• تنظیم تایم‌زون گروه: در پنل گروه یا «تنظیم زمان <chat_id> <Area/City>».\n"
-                "• شارژ دستی: «تمدید <chat_id> <days>».\n"
-                "• گزارش نصب/حذف به همین چت ارسال می‌شود.\n"
-                "• تست رایگان: هر گروه جدید ۷ روز رایگان."
+                "• «📋 لیست گروه‌ها» → پنل گروه (شارژ/تمدید/انقضا/خروج/افزودن).\n"
+                "• «🛍️ لیست فروشنده‌ها» → آمار/عزل/افزودن.\n"
+                "• «تنظیم زمان <chat_id> <Area/City>»، «تمدید <chat_id> <days>».\n"
+                "• ۷ روز تست رایگان برای هر گروه جدید فعال می‌شود."
             )
             await reply_temp(update, context, txt, reply_markup=contact_kb(
                 extra_rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0"),
@@ -468,14 +445,9 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_seller(s, uid):
             txt = (
                 "🛍️ «راهنمای فروشنده»\n"
-                "دستورات فروش:\n"
-                "• در گروه: «فضول شارژ» یا «⚙️ پیکربندی فضول» برای شارژ/تمدید.\n"
+                "• در گروه: «فضول شارژ» یا «⚙️ پیکربندی فضول».\n"
                 "• در پی‌وی: «📋 لیست گروه‌ها» → پنل هر گروه → شارژ ۳۰/۹۰/۱۸۰ روزه.\n"
-                "• مشاهده انقضا از پنل گروه.\n"
-                "\n"
-                "راهنمای کاربری برای مشتری‌ها:\n"
-                "• در گروه «فضول منو» بزنید؛ همه چیز با دکمه‌هاست.\n"
-                "• ۷ روز تست رایگان بعد از افزودن ربات فعال می‌شود."
+                "• به مشتری بگو در گروه «فضول منو» بزنند؛ همه‌چیز با دکمه‌هاست."
             )
             await reply_temp(update, context, txt, reply_markup=contact_kb(
                 extra_rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")]],
@@ -486,7 +458,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = (
                 "سلام! 👋\n"
                 "این ربات مخصوص گروه‌هاست. می‌تونی اضافه‌ش کنی و ۷ روز تست رایگان داشته باشی.\n"
-                "بعد از افزودن، در گروه «فضول منو» بزن تا همه‌چیز با دکمه‌های شیشه‌ای انجام بشه."
+                "بعد از افزودن، در گروه «فضول منو» بزن تا با دکمه‌ها کار کنی."
             )
             await reply_temp(update, context, txt, reply_markup=contact_kb(
                 extra_rows=[[InlineKeyboardButton("🧭 راهنمای استفاده در گروه", callback_data="usr:help")]],
@@ -516,7 +488,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_temp(update, context, "⚙️ پیکربندی فضول:", reply_markup=build_config_panel(update.effective_chat.id, context.bot.username))
         return
 
-    # Admin add/del
+    # ادمین اضافه/حذف
     if PAT_GROUP["admin_add"].match(text) or PAT_GROUP["admin_del"].match(text):
         m_add = PAT_GROUP["admin_add"].match(text)
         m_del = PAT_GROUP["admin_del"].match(text)
@@ -551,7 +523,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await reply_temp(update, context, "🗑️ ادمین گروه حذف شد.")
         return
 
-    # Block/Unblock seller per-group
+    # مسدود/آزاد فروشنده
     if PAT_GROUP["seller_block"].match(text) or PAT_GROUP["seller_unblock"].match(text):
         block = bool(PAT_GROUP["seller_block"].match(text))
         with SessionLocal() as s:
@@ -598,8 +570,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not await require_active_or_warn(update, context, s, g): return
             try: d = dt.date.fromisoformat(m.group(1))
             except ValueError:
-                await reply_temp(update, context, "تاریخ نامعتبر. فرمت YYYY-MM-DD")
-                return
+                await reply_temp(update, context, "تاریخ نامعتبر. فرمت YYYY-MM-DD"); return
             u = upsert_user(s, g.id, update.effective_user)
             u.birthday = d; s.commit()
             await reply_temp(update, context, f"تولد ثبت شد 🎂 (شمسی: {fmt_date_fa(d)})"); return
@@ -770,7 +741,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         InlineKeyboardButton("انصراف", callback_data="noop")]])
             await reply_temp(update, context, "⚠️ مطمئنی کل داده‌های گروه حذف شود؟", reply_markup=kb); return
 
-    # شمارش ریپلای‌ها (محبوب امروز)
+    # شمارش ریپلای‌ها
     if update.message.reply_to_message:
         with SessionLocal() as s:
             g = ensure_group(s, update.effective_chat)
@@ -804,7 +775,6 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_temp(update, context, txt, reply_markup=contact_kb(bot_username=bot_username)); return
             await reply_temp(update, context, "برای مدیریت باید مالک/فروشنده باشی. «/start» یا «کمک» بزن."); return
 
-        # OWNER/SELLER:
         if PAT_DM["panel"].match(text):
             who = "👑 پنل مالک" if uid==OWNER_ID else "🛍️ پنل فروشنده"
             await reply_temp(update, context, who, reply_markup=build_owner_panel()); return
@@ -885,10 +855,11 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data: return
+
+    # پاسخ فوری تا مطمئن شوید «کلیک» کار می‌کند حتی اگر ادامهٔ پردازش به هر دلیلی خطا بدهد
     try:
-        await q.answer(cache_time=0)
-    except Exception:
-        pass
+        await q.answer("✅ کلیک ثبت شد", cache_time=0, show_alert=False)
+    except Exception: ...
 
     autodel_qmessage(context, q.message)  # تایمر حذف برای پیام پنل
 
@@ -944,7 +915,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text(footer("⌁ پنل شارژ گروه:"), reply_markup=kb)
         return
 
-    # لیست گروه‌ها (صفحه‌بندی)
+    # لیست گروه‌ها
     if q.data.startswith("adm:groups"):
         parts = q.data.split(":")
         page = int(parts[2]) if len(parts)>=3 else 0
@@ -1006,7 +977,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("خطا در خروج (ممکن است عضو نباشم).", show_alert=True)
             return
 
-    # فروشنده‌ها: آمار/عزل/راهنما
+    # فروشنده‌ها
     if q.data == "adm:sellers":
         with SessionLocal() as s:
             sellers = s.query(Seller).order_by(Seller.id.asc()).all()
@@ -1068,7 +1039,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ex.is_active = False; s.commit()
                 await q.answer("🗑️ فروشنده عزل شد.", show_alert=True); return
             elif sub == "add" and arg=="help":
-                txt = "برای افزودن فروشنده: در همین چت بفرست:\n«افزودن فروشنده <tg_user_id> [yادداشت]»"
+                txt = "برای افزودن فروشنده: در همین چت بفرست:\n«افزودن فروشنده <tg_user_id> [یادداشت]»"
                 await q.message.reply_text(footer(txt)); return
 
     # گروه: مدیران
@@ -1107,7 +1078,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("ثبت شد ✅", show_alert=False)
         return
 
-    # تقویم تولد (انتخاب سال/ماه/روز)
+    # ثبت تولد با دکمه
     def _year_page(start_year: int) -> InlineKeyboardMarkup:
         years = [start_year+i for i in range(-8, 9)]
         rows = []
@@ -1182,8 +1153,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("تولد ثبت شد 🎂", show_alert=True)
         try:
             await q.edit_message_text(f"🎂 تاریخ تولد شما (شمسی): {fmt_date_fa(dt.date(Y,M,D))}")
-        except Exception:
-            pass
+        except Exception: ...
         if (q.message.chat.id, q.from_user.id) in PENDING_REL:
             pend = PENDING_REL.pop((q.message.chat.id, q.from_user.id), {})
             target_tg_id = pend.get("target_tg_id")
@@ -1203,7 +1173,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 s.commit()
             try:
                 await q.message.reply_text(f"💞 رابطه ثبت شد از تاریخ (شمسی) {fmt_date_fa(dt.date(Y,M,D))}")
-            except: pass
+            except: ...
         return
 
     if q.data == "bd:cancel":
@@ -1262,7 +1232,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("رابطه حذف شد 🗑️", show_alert=True)
         return
 
-    # محبوب/شیپ (پیام‌ها ماندگار)
+    # محبوب/شیپ (ماندگار)
     if q.data == "ui:pop":
         with SessionLocal() as s:
             g = ensure_group(s, q.message.chat)
@@ -1392,7 +1362,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.commit()
         try:
             await q.edit_message_text(footer("🧹 کل داده‌های این گروه پاک شد."))
-        except: pass
+        except: ...
         return
 
     if q.data == "noop":
@@ -1430,7 +1400,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"{fa_digits(i)}) {name} — {fa_digits(r.reply_count)} ریپلای")
                 try:
                     await context.bot.send_message(g.id, footer("🌙 محبوب‌های امروز:\n" + "\n".join(lines)))
-                except: pass
+                except: ...
             # شیپ فقط بین مجردها
             males = s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females = s.query(User).filter_by(chat_id=g.id, gender="female").all()
@@ -1445,7 +1415,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(g.id, footer(
                         f"💘 شیپِ امشب: {(m.first_name or '@'+(m.username or ''))} × {(f.first_name or '@'+(f.username or ''))}"
                     ))
-                except: pass
+                except: ...
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
@@ -1461,8 +1431,8 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                 if um==jm and ud==jd:
                     try:
                         await context.bot.send_message(g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
-                    except: pass
-            # ماهگرد رابطه‌ها (بر مبنای جلالی)
+                    except: ...
+            # ماهگرد رابطه‌ها (جلالی)
             rels = s.query(Relationship).filter_by(chat_id=g.id).all()
             for r in rels:
                 if not r.started_at: continue
@@ -1473,15 +1443,18 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(
                             g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})")
                         )
-                    except: pass
+                    except: ...
 
 # ====== BOOT ======
 async def _post_init(app: Application):
-    # حذف وب‌هوک قبلی تا polling همه کالبک‌ها را بگیرد
     try:
+        info = await app.bot.get_webhook_info()
+        if info.url:
+            logging.info(f"Webhook was set to: {info.url} — deleting…")
         await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
+        logging.info("Webhook deleted. Polling will receive ALL updates.")
+    except Exception as e:
+        logging.warning(f"delete_webhook failed: {e}")
     logging.info(f"PersianTools enabled: {HAS_PTOOLS}")
 
 def main():
@@ -1499,13 +1472,13 @@ def main():
     if jq is None:
         logging.warning('JobQueue فعال نیست. نصب کن: pip install "python-telegram-bot[job-queue]==21.6"')
     else:
-        jq.run_daily(job_morning, time=dt.time(6,0,0))   # 6 صبح UTC
+        jq.run_daily(job_morning, time=dt.time(6,0,0))   # 6 UTC
         jq.run_daily(job_midnight, time=dt.time(21,0,0)) # 21 UTC ~ حوالی آخر شب ایران
 
     logging.info("FazolBot running…")
-    # همه آپدیت‌ها + پاک‌کردن صف آپدیت‌های قدیمی
+    # allowed_updates صریح: کالبک‌ها تضمینی دریافت می‌شن
     app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
+        allowed_updates=["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"],
         drop_pending_updates=True
     )
 
