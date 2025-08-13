@@ -635,9 +635,13 @@ def main():
     # گزارش نصب/خروج
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # زمان‌بندی‌ها (UTC سراسری)
-    app.job_queue.run_daily(job_morning, time=dt.time(6,0,0))
-    app.job_queue.run_daily(job_midnight, time=dt.time(21,0,0))
+    # زمان‌بندی‌ها (UTC سراسری) — با چک JobQueue
+    jq = app.job_queue
+    if jq is None:
+        logging.warning('JobQueue فعال نیست. برای فعال‌سازی: pip install "python-telegram-bot[job-queue]==21.6"')
+    else:
+        jq.run_daily(job_morning, time=dt.time(6,0,0))
+        jq.run_daily(job_midnight, time=dt.time(21,0,0))
 
     logging.info("FazolBot FULL (single-file) is running…")
     app.run_polling()
