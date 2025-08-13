@@ -2,7 +2,7 @@ import os, logging, re, random, datetime as dt, asyncio, atexit, hashlib, urllib
 from typing import Optional, List, Tuple, Dict, Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey, Index
+from sqlalchemy import select, text, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey, Index, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 from sqlalchemy import create_engine
 
@@ -16,6 +16,8 @@ from telegram.error import Conflict as TgConflict
 
 # ================== CONFIG ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # لاگ‌های پر سروصدا خاموش‌تر
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
@@ -117,7 +119,7 @@ def to_jalali_md(d: dt.date) -> Tuple[int,int]:
         return j.month, j.day
     return d.month, d.day
 
-# — دیگر واترمارک نداریم
+# — بدون واترمارک
 def footer(text: str) -> str:
     return text
 
@@ -435,10 +437,9 @@ def mention_of(u: 'User') -> str:
 def mention_by_tgid(session, chat_id: int, tg_user_id: int) -> str:
     u = session.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tg_user_id)).scalar_one_or_none()
     if u: return mention_of(u)
-    # fallback
     return f'<a href="tg://user?id={tg_user_id}">کاربر</a>'
 
-# --------- نرمال‌سازی و تشخیص واژهٔ «فضول» ----------
+# --------- نرمال‌سازی ----------
 ARABIC_FIX_MAP = str.maketrans({
     "ي": "ی", "ى": "ی", "ئ": "ی", "ك": "ک",
     "ـ": "",
@@ -535,20 +536,18 @@ def kb_config(chat_id: int, bot_username: str) -> List[List[InlineKeyboardButton
 
 # ================== PATTERNS ==================
 PAT_GROUP = {
-    "ping": re.compile(r"^فضول$"),
     "menu": re.compile(r"^(?:فضول منو|منو)$"),
     "help": re.compile(r"^(?:فضول کمک|راهنما|کمک)$"),
     "config": re.compile(r"^(?:پیکربندی فضول|فضول پیکربندی|فضول تنظیمات|تنظیمات فضول)$"),
+    "bot_stats": re.compile(r"^(?:آمار فضول|فضول آمار|آمار ربات)$"),
     "admin_add": re.compile(r"^فضول ادمین(?: @?(\w+))?$"),
     "admin_del": re.compile(r"^حذف فضول ادمین(?: @?(\w+))?$"),
     "seller_block": re.compile(r"^(?:مسدود فروشنده)(?: @?(\w+))?$"),
     "seller_unblock": re.compile(r"^(?:آزاد فروشنده)(?: @?(\w+))?$"),
     "gender": re.compile(r"^ثبت جنسیت (دختر|پسر)$"),
-    # ویزارد جدید تولد: فقط "ثبت تولد" → ویزارد
     "birthday_wizard": re.compile(r"^ثبت تولد$"),
     "birthday_set": re.compile(r"^ثبت تولد ([\d\/\-]+)$"),
     "birthday_del": re.compile(r"^حذف تولد$"),
-    # ویزارد جدید رابطه: "ثبت رابطه @username"
     "relation_set_wizard": re.compile(r"^ثبت رابطه @?(\w+)$"),
     "relation_set": re.compile(r"^ثبت رابطه @?(\w+)\s+([\d\/\-]+)$"),
     "relation_del": re.compile(r"^حذف رابطه @?(\w+)$"),
@@ -568,7 +567,6 @@ PAT_GROUP = {
 }
 
 PAT_DM = {
-    "ping": re.compile(r"^فضول$"),
     "panel": re.compile(r"^(?:پنل|مدیریت|کمک)$"),
     "groups": re.compile(r"^گروه‌ها$"),
     "manage": re.compile(r"^مدیریت (\-?\d+)$"),
@@ -576,6 +574,7 @@ PAT_DM = {
     "add_seller": re.compile(r"^افزودن فروشنده (\d+)(?:\s+(.+))?$"),
     "del_seller": re.compile(r"^حذف فروشنده (\d+)$"),
     "list_sellers": re.compile(r"^لیست فروشنده‌ها$"),
+    "bot_stats": re.compile(r"^(?:آمار فضول|فضول آمار|آمار ربات)$"),
 }
 
 # ================== INTRO TEXT ==================
@@ -623,6 +622,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "👑 به پنل مالک خوش آمدی!\n"
                 "• «📋 لیست گروه‌ها» برای شارژ/انقضا/خروج/افزودن\n"
                 "• «🛍️ لیست فروشنده‌ها» برای آمار/عزل/افزودن\n"
+                "• «آمار فضول» برای آمار کلی ربات\n"
                 "• «فضول» → پاسخ سلامت: جانم"
             )
             await panel_open_initial(update, context, txt,
@@ -672,17 +672,47 @@ def user_help_text() -> str:
         "• «فضول انقضا» نمایش پایان اعتبار گروه"
     )
 
+# ================== BOT STATS (OWNER ONLY) ==================
+def build_bot_stats_text(s) -> str:
+    now = dt.datetime.utcnow()
+    total_groups = s.query(func.count(Group.id)).scalar() or 0
+    active_groups = s.query(func.count(Group.id)).filter(Group.expires_at != None, Group.expires_at > now).scalar() or 0
+    expired_groups = total_groups - active_groups
+
+    total_users = s.query(func.count(User.id)).scalar() or 0
+    male = s.query(func.count(User.id)).filter(User.gender=="male").scalar() or 0
+    female = s.query(func.count(User.id)).filter(User.gender=="female").scalar() or 0
+    unknown = total_users - male - female
+
+    rels = s.query(func.count(Relationship.id)).scalar() or 0
+    crushes = s.query(func.count(Crush.id)).scalar() or 0
+    ships = s.query(func.count(ShipHistory.id)).scalar() or 0
+
+    today = dt.datetime.now(TZ_TEHRAN).date()
+    today_stats = s.query(func.count(ReplyStatDaily.id)).filter(ReplyStatDaily.date==today).scalar() or 0
+
+    sellers_total = s.query(func.count(Seller.id)).scalar() or 0
+    sellers_active = s.query(func.count(Seller.id)).filter(Seller.is_active==True).scalar() or 0
+
+    lines = [
+        f"📊 آمار کلی ربات:",
+        f"• گروه‌ها: {fa_digits(total_groups)} (فعال: {fa_digits(active_groups)} | منقضی: {fa_digits(expired_groups)})",
+        f"• کاربران: {fa_digits(total_users)} (دختر: {fa_digits(female)} | پسر: {fa_digits(male)} | نامشخص: {fa_digits(unknown)})",
+        f"• روابط: {fa_digits(rels)} | کراش‌ها: {fa_digits(crushes)} | شیپ‌ها: {fa_digits(ships)}",
+        f"• ردیابی ریپلای امروز: {fa_digits(today_stats)} رکورد",
+        f"• فروشنده‌ها: {fa_digits(sellers_total)} (فعال: {fa_digits(sellers_active)})",
+    ]
+    return "\n".join(lines)
+
 # ================== GROUP TEXT ==================
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text:
         return
+    logging.info(f"[grp] msg from {update.effective_user.id if update.effective_user else '-'}: {update.message.text}")
     text = clean_text(update.message.text)
 
-    # پاسخ سلامت fallback اگر هرجور «فضول» دیده شد
+    # «فضول منو» یا «فضول کمک» با وجود کلمهٔ فضول
     if RE_WORD_FAZOL.search(text):
-        if text == "فضول":
-            await reply_temp(update, context, "جانم 👂")
-            return
         if "منو" in text or "فهرست" in text:
             with SessionLocal() as s:
                 g = ensure_group(s, update.effective_chat)
@@ -694,11 +724,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "کمک" in text or "راهنما" in text:
             await reply_temp(update, context, user_help_text())
             return
-
-    # لایو‌چک دقیق
-    if PAT_GROUP["ping"].match(text):
-        await reply_temp(update, context, "جانم 👂")
-        return
 
     with SessionLocal() as s:
         g = ensure_group(s, update.effective_chat)
@@ -714,6 +739,14 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # راهنما
     if PAT_GROUP["help"].match(text):
         await reply_temp(update, context, user_help_text())
+        return
+
+    # آمار فضول (فقط مالک)
+    if PAT_GROUP["bot_stats"].match(text):
+        if update.effective_user.id != OWNER_ID:
+            await reply_temp(update, context, "فقط مالک می‌تواند این دستور را اجرا کند."); return
+        with SessionLocal() as s:
+            await reply_temp(update, context, build_bot_stats_text(s))
         return
 
     # پیکربندی + پنل
@@ -772,7 +805,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u.gender = gender; s.commit()
             await reply_temp(update, context, "ثبت شد ✅"); return
 
-        # ثبت تولد — ویزارد با دستور متنی
+        # ثبت تولد — ویزارد
         if PAT_GROUP["birthday_wizard"].match(text):
             title = "سال تولدت رو انتخاب کن (شمسی)"
             y = jalali_now_year()
@@ -784,7 +817,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await panel_open_initial(update, context, title, rows, root=False)
             return
 
-        # ثبت تولد — مستقیم با تاریخ متنی هم پشتیبانی می‌شود
+        # تولد — مستقیم
         if m := PAT_GROUP["birthday_set"].match(text):
             if not group_active(g):
                 await reply_temp(update, context, "⌛️ اعتبار گروه تمام شده."); return
@@ -814,7 +847,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await panel_open_initial(update, context, title, rows, root=False)
             return
 
-        # ثبت رابطه — تاریخ متنی هم پشتیبانی می‌شود
+        # ثبت رابطه — تاریخ متنی
         if m := PAT_GROUP["relation_set"].match(text):
             if not group_active(g):
                 await reply_temp(update, context, "⌛️ اعتبار گروه تمام شده."); return
@@ -1024,15 +1057,12 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.reply_count += 1
             s.commit()
 
-# ================== PRIVATE (OWNER/SELLER) ==================
+# ================== PRIVATE (OWNER/SELLER/USER) ==================
 async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not update.message or not update.message.text:
         return
+    logging.info(f"[pv] msg from {update.effective_user.id if update.effective_user else '-'}: {update.message.text}")
     text = clean_text(update.message.text)
-
-    # فول‌بک «فضول»
-    if RE_WORD_FAZOL.search(text):
-        await reply_temp(update, context, "جانم 👂")
 
     bot_username = context.bot.username
     with SessionLocal() as s:
@@ -1044,14 +1074,25 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  "این ربات مخصوص گروه‌هاست. با دکمهٔ زیر اضافه کن و ۷ روز رایگان استفاده کن.\nدر گروه «فضول» و «فضول منو» را بزن.",
                                  reply_markup=contact_kb(bot_username=bot_username), keep=True)
                 return
+            if PAT_DM["bot_stats"].match(text):
+                await reply_temp(update, context, "فقط مالک می‌تواند این دستور را اجرا کند."); return
+            # fallback help
             await reply_temp(update, context, "برای مدیریت باید مالک/فروشنده باشی. «/start» یا «کمک» بزن."); return
 
+        # پنل
         if PAT_DM["panel"].match(text):
             who = "👑 پنل مالک" if uid==OWNER_ID else "🛍️ پنل فروشنده"
             await panel_open_initial(update, context, who,
                                      [[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
                                       [InlineKeyboardButton("🛍️ لیست فروشنده‌ها", callback_data="adm:sellers")] if uid==OWNER_ID else []],
                                      root=True)
+            return
+
+        # آمار فضول (فقط مالک)
+        if PAT_DM["bot_stats"].match(text):
+            if uid != OWNER_ID:
+                await reply_temp(update, context, "فقط مالک می‌تواند این دستور را اجرا کند."); return
+            await reply_temp(update, context, build_bot_stats_text(s), keep=True)
             return
 
         if PAT_DM["groups"].match(text):
@@ -1600,6 +1641,19 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         os._exit(0)
     logging.exception("Unhandled error", exc_info=err)
 
+# ================== FALLBACK PING (ALWAYS) ==================
+async def on_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اگر هیچ هندلر دیگری جواب نداد، گفتن «فضول» جواب «جانم» می‌گیرد."""
+    m = update.effective_message
+    if not m: return
+    txt = clean_text((m.text or m.caption or "") or "")
+    # فقط وقتی دقیقاً «فضول» باشد تا با «فضول منو/کمک» تداخل نکند
+    if txt == "فضول":
+        try:
+            await m.reply_text("جانم 👂")
+        except Exception:
+            pass
+
 # ================== BOOT ==================
 async def _post_init(app: Application):
     try:
@@ -1629,6 +1683,9 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(error_handler)
+
+    # فول‌بک «فضول» ← «جانم»
+    app.add_handler(MessageHandler(filters.ALL, on_any), group=100)
 
     jq = app.job_queue
     if jq is None:
