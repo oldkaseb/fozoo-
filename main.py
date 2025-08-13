@@ -19,37 +19,67 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Tehran")
 
-# -------------------- DB (Railway + SSL Patch) --------------------
+# -------------------- DB (Railway + SSL Patch + Validation) --------------------
 import urllib.parse as _up
 Base = declarative_base()
 
-db_url = os.getenv("DATABASE_URL", "").strip()
-if not db_url:
-    raise RuntimeError("DATABASE_URL env var is required (Railway PostgreSQL).")
+def _mask_url(u: str) -> str:
+    try:
+        parts = _up.urlsplit(u)
+        if parts.username or parts.password:
+            netloc = parts.hostname or ""
+            if parts.port: netloc += f":{parts.port}"
+            return _up.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        pass
+    return "<unparsable>"
 
-# تبدیل scheme به درایور psycopg2 برای SQLAlchemy
+# 1) Read DATABASE_URL or build from PG* vars
+raw_db_url = (os.getenv("DATABASE_URL") or "").strip()
+if not raw_db_url:
+    PGHOST = os.getenv("PGHOST")
+    PGPORT = os.getenv("PGPORT", "5432")
+    PGUSER = os.getenv("PGUSER")
+    PGPASSWORD = os.getenv("PGPASSWORD")
+    PGDATABASE = os.getenv("PGDATABASE", "railway")
+    if all([PGHOST, PGUSER, PGPASSWORD]):
+        raw_db_url = f"postgresql://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDATABASE}"
+    else:
+        raise RuntimeError("DATABASE_URL یافت نشد و متغیرهای PGHOST/PGUSER/PGPASSWORD هم ست نیستند.")
+
+db_url = raw_db_url
+
+# 2) driver & sslmode
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
 elif db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-
-# اجباری کردن SSL برای Railway (اگر در URL نبود)
 if "sslmode=" not in db_url:
     sep = "&" if "?" in db_url else "?"
     db_url = f"{db_url}{sep}sslmode=require"
 
-# لاگ کوچک برای عیب‌یابی هاست/پورت/نام‌DB (بدون لو دادن پسورد)
+# 3) validate host
 try:
     parsed = _up.urlsplit(db_url)
+    host_ok = bool(parsed.hostname)
     logging.info(f"DB host: {parsed.hostname}, port: {parsed.port}, db: {parsed.path}")
 except Exception:
-    logging.info("DB URL parsed.")
+    host_ok = False
+    logging.info("DB URL parsed = <error>")
+if not host_ok:
+    masked = _mask_url(raw_db_url)
+    raise RuntimeError(
+        "DATABASE_URL نامعتبر است (هاست ندارد). مقدار فعلی (بدون پسورد): "
+        f"{masked}\n"
+        "در Railway از Postgres → Connect → External Connection String کپی کن و با کلید DATABASE_URL در سرویس ربات ست کن."
+    )
 
+# 4) engine
 engine = create_engine(
     db_url,
     pool_pre_ping=True,
     future=True,
-    connect_args={"sslmode": "require"},  # محکم‌کاری
+    connect_args={"sslmode": "require"},
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
@@ -169,7 +199,7 @@ async def require_active_or_warn(update: Update, context: ContextTypes.DEFAULT_T
     except: pass
     return False
 
-def upsert_user(session, chat_id, tg_user) -> User:
+def upsert_user(session, chat_id, tg_user) -> 'User':
     u = session.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tg_user.id)).scalar_one_or_none()
     if not u:
         u = User(chat_id=chat_id, tg_user_id=tg_user.id,
@@ -198,7 +228,7 @@ def chunked(lst: List, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-def mention_of(u: User) -> str:
+def mention_of(u: 'User') -> str:
     if u.username:
         return f"@{u.username}"
     name = u.first_name or "کاربر"
@@ -370,7 +400,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]])
             return await update.message.reply_text("⌁ پنل شارژ گروه:", reply_markup=kb)
 
-        # تگ‌ها (با ریپلای، ۴تایی-۴تایی، ریپلای روی همان پیام)
+        # تگ‌ها (با ریپلای، ۴تایی، ریپلای روی همان پیام)
         if PAT_GROUP["tag_girls"].match(text) or PAT_GROUP["tag_boys"].match(text) or PAT_GROUP["tag_all"].match(text):
             if not update.message.reply_to_message:
                 return await update.message.reply_text("برای تگ کردن، باید روی یک پیام ریپلای کنی.")
