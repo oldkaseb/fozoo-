@@ -427,9 +427,29 @@ def is_group_admin(session, chat_id: int, tg_user_id: int) -> bool:
 def group_active(g: Group) -> bool:
     return bool(g.expires_at and g.expires_at > dt.datetime.utcnow())
 
-def clean_text(s: str) -> str: return re.sub(r"\s+", " ", s.strip())
+# --------- نرمال‌سازی و تشخیص واژهٔ «فضول» ----------
+ARABIC_FIX_MAP = str.maketrans({
+    "ي": "ی", "ى": "ی", "ئ": "ی", "ك": "ک",
+    "ـ": "",
+})
+PUNCS = " \u200c\u200f\u200e\u2066\u2067\u2068\u2069\t\r\n.,!?؟،;:()[]{}«»\"'"
+
+def fa_norm(s: str) -> str:
+    if s is None: return ""
+    s = str(s).translate(ARABIC_FIX_MAP)
+    s = s.replace("\u200c", " ").replace("\u200f", "").replace("\u200e","")
+    s = s.replace("\u202a","").replace("\u202c","")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def clean_text(s: str) -> str:
+    return fa_norm(s)
+
+RE_WORD_FAZOL = re.compile(rf"(?:^|[{re.escape(PUNCS)}])فضول(?:[{re.escape(PUNCS)}]|$)")
+
 def chunked(lst: List, n: int):
     for i in range(0, len(lst), n): yield lst[i:i+n]
+
 def mention_of(u: 'User') -> str:
     if u.username: return f"@{u.username}"
     name = u.first_name or "کاربر"
@@ -646,7 +666,24 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = clean_text(update.message.text)
 
-    # لایو‌چک
+    # پاسخ سلامت fallback اگر هرجور «فضول» دیده شد
+    if RE_WORD_FAZOL.search(text):
+        if text == "فضول":
+            await reply_temp(update, context, "جانم 👂")
+            return
+        if "منو" in text or "فهرست" in text:
+            with SessionLocal() as s:
+                g = ensure_group(s, update.effective_chat)
+                is_gadmin = is_group_admin(s, g.id, update.effective_user.id)
+            title = "🕹 منوی فضول"
+            rows = kb_group_menu(is_gadmin)
+            await panel_open_initial(update, context, title, rows, root=True)
+            return
+        if "کمک" in text or "راهنما" in text:
+            await reply_temp(update, context, user_help_text())
+            return
+
+    # لایو‌چک دقیق
     if PAT_GROUP["ping"].match(text):
         await reply_temp(update, context, "جانم 👂")
         return
@@ -926,10 +963,9 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = clean_text(update.message.text)
 
-    # لایو‌چک
-    if PAT_DM["ping"].match(text):
+    # فول‌بک «فضول»
+    if RE_WORD_FAZOL.search(text):
         await reply_temp(update, context, "جانم 👂")
-        return
 
     bot_username = context.bot.username
     with SessionLocal() as s:
@@ -1073,7 +1109,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cfg:open":
         with SessionLocal() as s:
             if not is_group_admin(s, chat_id, user_id):
-                await panel_edit(context, msg, user_id, "دسترسی نداری.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
+                await panel_edit(context, msg, user_id, "دسترسی نداری.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False)
                 return
         rows = kb_config(chat_id, context.bot.username)
         await panel_edit(context, msg, user_id, "⚙️ پیکربندی فضول", rows, root=False)
@@ -1185,7 +1221,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ثبت تولد — ویزارد سال/ماه/روز (شمسی)
     if data == "ui:bd:start":
         y = jalali_now_year()
-        # صفحهٔ سال‌ها (۴×۴ = 16 سال اخیر)
         years = list(range(y, y-16, -1))
         rows=[]
         for chunk in chunked(years, 4):
