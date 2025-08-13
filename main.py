@@ -1,4 +1,4 @@
-import os, logging, re, random, datetime as dt, asyncio, atexit, hashlib, urllib.parse as _up
+import os, logging, re, random, datetime as dt, asyncio, atexit, hashlib, urllib.parse as _up, math
 from typing import Optional, List, Tuple, Dict, Any
 from zoneinfo import ZoneInfo
 
@@ -82,7 +82,8 @@ def parse_jalali_date_input(s: str) -> dt.date:
         raise ValueError("Gregorian not allowed")
     if HAS_PTOOLS:
         return JalaliDate(y, m, d).to_gregorian()
-    return dt.date(y if y>1900 else 2000+y%100, m, d)
+    # fallback ساده؛ در عمل با persiantools هستید
+    return dt.date(2000+y%100, m, d)
 
 def jalali_now_year() -> int:
     now = dt.datetime.now(TZ_TEHRAN)
@@ -122,7 +123,7 @@ def footer(text: str) -> str:
 
 def contact_kb(extra_rows: List[List[InlineKeyboardButton]]|None=None, bot_username: Optional[str]=None) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    if extra_rows: rows.extend(extra_rows)
+    if extra_rows: rows.extend([r for r in extra_rows if r])
     rows.append([InlineKeyboardButton("📞 تماس با مالک", url=f"https://t.me/{OWNER_CONTACT_USERNAME}")])
     if bot_username:
         rows.append([InlineKeyboardButton("➕ افزودن ربات به گروه", url=f"https://t.me/{bot_username}?startgroup=true")])
@@ -206,7 +207,6 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 # --- Singleton guard ---
 SINGLETON_CONN = None
 SINGLETON_KEY = None
-REL_TARGET: Dict[Tuple[int,int], int] = {}
 
 def _advisory_key() -> int:
     return int(hashlib.blake2b(TOKEN.encode(), digest_size=8).hexdigest(), 16) % (2**31)
@@ -257,7 +257,10 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             SINGLETON_CONN = engine.raw_connection()
-            if not _acquire_lock(SINGLETON_CONN, SINGLETON_KEY):
+            cur = SINGLETON_CONN.cursor()
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
+            ok = cur.fetchone()[0]
+            if not ok:
                 logging.error("Lost advisory lock, another instance holds it now. Exiting.")
                 os._exit(0)
             logging.info("Advisory lock re-acquired after DB restart.")
@@ -265,7 +268,6 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Failed to re-acquire advisory lock: {e2}")
 
 # ================== MODELS ==================
-from sqlalchemy.orm import relationship  # (not used directly, but kept for future)
 class Group(Base):
     __tablename__ = "groups"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -390,7 +392,7 @@ def ensure_group(session, chat) -> 'Group':
         if g.timezone != DEFAULT_TZ:
             g.timezone = DEFAULT_TZ
             session.commit()
-    g._just_created = created  # پرچم کمکی
+    g._just_created = created
     return g
 
 def upsert_user(session, chat_id, tg_user) -> 'User':
@@ -466,11 +468,13 @@ def _panel_pop(msg) -> Optional[Tuple[str, List[List[InlineKeyboardButton]], boo
 async def panel_open_initial(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str, rows: List[List[InlineKeyboardButton]], root: bool=True):
     msg = await update.effective_chat.send_message(footer(title), reply_markup=add_nav(rows, root=root))
     _panel_push(msg, update.effective_user.id, title, rows, root)
+    schedule_autodelete(context, msg.chat_id, msg.message_id, keep=False)
     return msg
 
-async def panel_edit(qmsg, opener_id: int, title: str, rows: List[List[InlineKeyboardButton]], root: bool=False):
+async def panel_edit(context: ContextTypes.DEFAULT_TYPE, qmsg, opener_id: int, title: str, rows: List[List[InlineKeyboardButton]], root: bool=False):
     await qmsg.edit_text(footer(title), reply_markup=add_nav(rows, root=root), disable_web_page_preview=True)
     _panel_push(qmsg, opener_id, title, rows, root)
+    schedule_autodelete(context, qmsg.chat.id, qmsg.message_id, keep=False)
 
 def kb_group_menu(is_group_admin_flag: bool) -> List[List[InlineKeyboardButton]]:
     rows = [
@@ -505,7 +509,7 @@ def kb_config(chat_id: int, bot_username: str) -> List[List[InlineKeyboardButton
 
 # ================== PATTERNS ==================
 PAT_GROUP = {
-    "ping": re.compile(r"^فضول$"),  # NEW: لایو‌چک
+    "ping": re.compile(r"^فضول$"),
     "menu": re.compile(r"^(?:فضول منو|منو)$"),
     "help": re.compile(r"^(?:فضول کمک|راهنما|کمک)$"),
     "config": re.compile(r"^(?:پیکربندی فضول|فضول پیکربندی|فضول تنظیمات|تنظیمات فضول)$"),
@@ -533,7 +537,7 @@ PAT_GROUP = {
 }
 
 PAT_DM = {
-    "ping": re.compile(r"^فضول$"),  # NEW: لایو‌چک PV
+    "ping": re.compile(r"^فضول$"),
     "panel": re.compile(r"^(?:پنل|مدیریت|کمک)$"),
     "groups": re.compile(r"^گروه‌ها$"),
     "manage": re.compile(r"^مدیریت (\-?\d+)$"),
@@ -554,9 +558,8 @@ def group_intro_text(bot_username: str) -> str:
         "برای افزودنم به گروه‌های دیگه از دکمهٔ زیر استفاده کن."
     )
 
-# ============== SYNC TG ADMINS => GroupAdmin (Auto) ==============
+# ============== SYNC TG ADMINS => GroupAdmin ==============
 async def sync_group_admins(bot, chat_id: int):
-    """همگام‌سازی: همهٔ ادمین‌های تلگرام → GroupAdmin (غیر‌بات)"""
     admins = await bot.get_chat_administrators(chat_id)
     tg_ids = [a.user.id for a in admins if not a.user.is_bot]
     if not tg_ids: return 0
@@ -643,7 +646,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = clean_text(update.message.text)
 
-    # NEW: لایو‌چک «فضول»
+    # لایو‌چک
     if PAT_GROUP["ping"].match(text):
         await reply_temp(update, context, "جانم 👂")
         return
@@ -664,12 +667,11 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_temp(update, context, user_help_text())
         return
 
-    # پیکربندی (همگام‌سازی ادمین‌های تلگرام → ادمین فضول)
+    # پیکربندی
     if PAT_GROUP["config"].match(text):
         with SessionLocal() as s:
             if not is_group_admin(s, update.effective_chat.id, update.effective_user.id):
                 await reply_temp(update, context, "فقط مدیر گروه/فروشنده/مالک می‌تواند."); return
-        # همگام‌سازی
         added = await sync_group_admins(context.bot, update.effective_chat.id)
         title = f"⚙️ پیکربندی فضول\nادمین‌های تلگرام همگام شد: {fa_digits(added)} نفر جدید"
         rows = kb_config(update.effective_chat.id, context.bot.username)
@@ -708,13 +710,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_temp(update, context, "🗑️ ادمین گروه حذف شد.")
         return
 
-    # ... (باقی دستورات همانند نسخه قبلی)
-    # — از اینجا به بعد، تمام بلوک‌های قبلی برای تولد/رابطه/کراش/تگ/انقضا/شارژ/پرایوسی و ... بدون تغییر مانده‌اند —
-    # برای کوتاهی پاسخ، این بخش‌ها همان کدی هستند که در نسخهٔ قبل بهت دادم (هیچ رفتاری حذف نشده).
-    # اگر لازم داری دوباره همین‌جا تکرارش کنم، بگو تا کل فایل را بدون حذف کوچک‌سازی ارسال کنم.
-    # ⬇️ ادامه همان کد قبلی (بدون تغییر) ⬇️
-
-    # ===== از این خط به بعد کدهای قبلی را نگه داشته‌ایم =====
+    # ===== سایر دستورات متنی =====
     with SessionLocal() as s:
         g = ensure_group(s, update.effective_chat)
 
@@ -930,7 +926,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = clean_text(update.message.text)
 
-    # NEW: لایو‌چک «فضول» در PV
+    # لایو‌چک
     if PAT_DM["ping"].match(text):
         await reply_temp(update, context, "جانم 👂")
         return
@@ -1028,9 +1024,332 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_temp(update, context, "🗑️ فروشنده عزل شد."); return
 
 # ================== CALLBACKS ==================
-# (بدون تغییر نسبت به نسخهٔ قبلی؛ همان رفتار ادیت روی همان پیام + بازگشت/بستن)
-# ... [تمام کال‌بک‌ها عیناً همان هستند که قبلاً ارسال شده بود] ...
-# برای اختصار، تغییری نداشتند جز بخش cfg:open که دست نخورده باقی ماند.
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    data = q.data or ""
+    user_id = q.from_user.id
+    msg = q.message
+    chat_id = msg.chat.id if msg else None
+
+    # مالکیت پنل
+    key = _panel_key(chat_id, msg.message_id)
+    meta = PANELS.get(key)
+    if not meta:
+        await q.answer("این پنل منقضی شده. دوباره بازش کن.", show_alert=True)
+        return
+    if meta.get("owner") != user_id:
+        await q.answer("این منو فقط برای کسی است که آن را باز کرده.", show_alert=True)
+        return
+
+    await q.answer()
+
+    # ناوبری
+    if data == "nav:close":
+        try:
+            await msg.delete()
+        except Exception: ...
+        PANELS.pop(key, None)
+        return
+
+    if data == "nav:back":
+        prev = _panel_pop(msg)
+        if not prev:
+            try:
+                await msg.delete()
+            except Exception: ...
+            PANELS.pop(key, None)
+            return
+        title, rows, root = prev
+        await panel_edit(context, msg, user_id, title, rows, root=root)
+        return
+
+    # کمک کاربر در PV
+    if data == "usr:help":
+        await panel_edit(context, msg, user_id, user_help_text(), [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
+        return
+
+    # پنل گروه: پیکربندی
+    if data == "cfg:open":
+        with SessionLocal() as s:
+            if not is_group_admin(s, chat_id, user_id):
+                await panel_edit(context, msg, user_id, "دسترسی نداری.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
+                return
+        rows = kb_config(chat_id, context.bot.username)
+        await panel_edit(context, msg, user_id, "⚙️ پیکربندی فضول", rows, root=False)
+        return
+
+    # مشاهده انقضا
+    if data == "ui:expiry":
+        with SessionLocal() as s:
+            g = s.get(Group, chat_id)
+            ex = g and g.expires_at and fmt_dt_fa(g.expires_at)
+        await panel_edit(context, msg, user_id, f"⏳ اعتبار گروه تا: {ex or 'نامشخص'}", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False)
+        return
+
+    # شارژ گروه (پنل)
+    if data == "ui:charge:open":
+        kb = [
+            [InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{chat_id}:30"),
+             InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{chat_id}:90"),
+             InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{chat_id}:180")],
+            [InlineKeyboardButton("⛔️ صفر کردن شارژ", callback_data=f"chg:{chat_id}:0")]
+        ]
+        await panel_edit(context, msg, user_id, "⌁ پنل شارژ گروه", kb, root=False)
+        return
+
+    # اعمال شارژ/صفرکردن
+    m = re.match(r"^chg:(-?\d+):(\d+)$", data)
+    if m:
+        target_chat = int(m.group(1)); days = int(m.group(2))
+        with SessionLocal() as s:
+            if not is_group_admin(s, target_chat, user_id):
+                await panel_edit(context, msg, user_id, "دسترسی نداری.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False)
+                return
+            g = s.get(Group, target_chat)
+            if not g:
+                await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False); return
+            if days <= 0:
+                g.expires_at = dt.datetime.utcnow()
+                s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="reset", amount_days=0))
+                s.commit()
+                await panel_edit(context, msg, user_id, "⛔️ شارژ گروه صفر شد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+            else:
+                base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
+                g.expires_at = base + dt.timedelta(days=days)
+                s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="extend", amount_days=days))
+                s.commit()
+                await panel_edit(context, msg, user_id, f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    # خروج ربات
+    m = re.match(r"^grp:(-?\d+):leave$", data)
+    if m:
+        target_chat = int(m.group(1))
+        with SessionLocal() as s:
+            if not is_group_admin(s, target_chat, user_id):
+                await panel_edit(context, msg, user_id, "دسترسی نداری.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False); return
+        await panel_edit(context, msg, user_id, "در حال ترک گروه…", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
+        try:
+            await context.bot.leave_chat(target_chat)
+        except Exception: ...
+        return
+
+    # پاکسازی گروه (تایید)
+    m = re.match(r"^wipe:(-?\d+)$", data)
+    if m:
+        target_chat = int(m.group(1))
+        with SessionLocal() as s:
+            if not is_group_admin(s, target_chat, user_id):
+                await panel_edit(context, msg, user_id, "دسترسی نداری.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False); return
+            s.execute(Crush.__table__.delete().where(Crush.chat_id==target_chat))
+            s.execute(Relationship.__table__.delete().where(Relationship.chat_id==target_chat))
+            s.execute(ReplyStatDaily.__table__.delete().where(ReplyStatDaily.chat_id==target_chat))
+            s.execute(User.__table__.delete().where(User.chat_id==target_chat))
+            s.commit()
+        await panel_edit(context, msg, user_id, "🧹 پاکسازی انجام شد.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False)
+        return
+
+    # لیست ادمین‌های گروه
+    if data == "ga:list":
+        with SessionLocal() as s:
+            gas = s.query(GroupAdmin).filter_by(chat_id=chat_id).all()
+        if not gas:
+            txt = "ادمینی ثبت نشده. «پیکربندی فضول» را بزن تا ادمین‌ها همگام شوند."
+        else:
+            ids = [str(ga.tg_user_id) for ga in gas[:50]]
+            txt = "👥 ادمین‌های فضول:\n" + "\n".join(f"- {fa_digits(i+1)}) {ids[i]}" for i in range(len(ids)))
+        await panel_edit(context, msg, user_id, txt, [[InlineKeyboardButton("همگام‌سازی مجدد", callback_data="cfg:sync")]], root=False)
+        return
+
+    if data == "cfg:sync":
+        added = await sync_group_admins(context.bot, chat_id)
+        await panel_edit(context, msg, user_id, f"✅ همگام شد. ادمین‌های جدید: {fa_digits(added)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    # ثبت جنسیت
+    if data == "ui:gset":
+        rows = [[InlineKeyboardButton("👧 دختر", callback_data="gset:f")],
+                [InlineKeyboardButton("👦 پسر", callback_data="gset:m")]]
+        await panel_edit(context, msg, user_id, "جنسیتت چیه؟", rows, root=False)
+        return
+
+    if data.startswith("gset:"):
+        is_female = data.endswith(":f")
+        with SessionLocal() as s:
+            u = upsert_user(s, chat_id, update.effective_user)
+            u.gender = "female" if is_female else "male"; s.commit()
+        await panel_edit(context, msg, user_id, "ثبت شد ✅", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    # ثبت تولد — ویزارد سال/ماه/روز (شمسی)
+    if data == "ui:bd:start":
+        y = jalali_now_year()
+        # صفحهٔ سال‌ها (۴×۴ = 16 سال اخیر)
+        years = list(range(y, y-16, -1))
+        rows=[]
+        for chunk in chunked(years, 4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in chunk])
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"bd:yp:{y-16}")])
+        await panel_edit(context, msg, user_id, "سال تولدت رو انتخاب کن (شمسی)", rows, root=False)
+        return
+
+    m = re.match(r"^bd:yp:(\d+)$", data)
+    if m:
+        start = int(m.group(1))
+        years = list(range(start, start-16, -1))
+        rows=[]
+        for chunk in chunked(years, 4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in chunk])
+        rows.append([InlineKeyboardButton("قدیمی‌تر", callback_data=f"bd:yp:{start-16}")])
+        await panel_edit(context, msg, user_id, "سال تولدت رو انتخاب کن (شمسی)", rows, root=False)
+        return
+
+    m = re.match(r"^bd:y:(\d+)$", data)
+    if m:
+        yy = int(m.group(1))
+        rows=[]
+        for i in range(1, 13):
+            rows.append([InlineKeyboardButton(fa_digits(f"{i:02d}"), callback_data=f"bd:m:{yy}:{i}")])
+        await panel_edit(context, msg, user_id, f"سال {fa_digits(yy)} — ماه تولد را انتخاب کن", rows, root=False)
+        return
+
+    m = re.match(r"^bd:m:(\d+):(\d+)$", data)
+    if m:
+        yy = int(m.group(1)); mm = int(m.group(2))
+        md = jalali_month_len(yy, mm)
+        rows=[]
+        for chunk in chunked(list(range(1, md+1)), 6):
+            rows.append([InlineKeyboardButton(fa_digits(f"{d:02d}"), callback_data=f"bd:d:{yy}:{mm}:{d}") for d in chunk])
+        await panel_edit(context, msg, user_id, f"تاریخ: {fa_digits(yy)}/{fa_digits(mm):s} — روز را انتخاب کن", rows, root=False)
+        return
+
+    m = re.match(r"^bd:d:(\d+):(\d+):(\d+)$", data)
+    if m:
+        yy, mm, dd = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        try:
+            gdate = JalaliDate(yy, mm, dd).to_gregorian() if HAS_PTOOLS else dt.date(2000+yy%100, mm, dd)
+        except Exception:
+            await panel_edit(context, msg, user_id, "تاریخ نامعتبر شد. دوباره تلاش کن.", [[InlineKeyboardButton("برگشت", callback_data="ui:bd:start")]], root=False)
+            return
+        with SessionLocal() as s:
+            u = upsert_user(s, chat_id, update.effective_user)
+            u.birthday = gdate; s.commit()
+        await panel_edit(context, msg, user_id, f"🎂 تولد ثبت شد: {fmt_date_fa(gdate)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    # راهنمای عملیات‌هایی که ریپلای می‌خواهند
+    if data in ("ui:crush:add","ui:crush:del","ui:rel:add","ui:rel:del","ui:tag:girls","ui:tag:boys","ui:tag:all","ui:pop","ui:ship","ui:privacy:me","ui:privacy:delme"):
+        hints = {
+            "ui:crush:add": "برای «ثبت کراش»، روی پیام شخص ریپلای کن و بنویس «ثبت کراش».",
+            "ui:crush:del": "برای «حذف کراش»، روی پیام شخص ریپلای کن و بنویس «حذف کراش».",
+            "ui:rel:add": "برای «ثبت رابطه»، دستور «ثبت رابطه @username ۱۴۰۲/۱۲/۰۱» را بزن.",
+            "ui:rel:del": "برای «حذف رابطه»، دستور «حذف رابطه @username» را بزن.",
+            "ui:tag:girls": "برای «تگ دخترها»، روی یک پیام ریپلای کن و بنویس: تگ دخترها",
+            "ui:tag:boys": "برای «تگ پسرها»، روی یک پیام ریپلای کن و بنویس: تگ پسرها",
+            "ui:tag:all": "برای «تگ همه»، روی یک پیام ریپلای کن و بنویس: تگ همه",
+            "ui:pop": "برای «محبوب امروز»، همین دستور را در گروه بزن.",
+            "ui:ship": "برای «شیپ امشب»، همین دستور را در گروه بزن.",
+            "ui:privacy:me": "برای «حذف من»، همین دستور را در گروه بزن.",
+            "ui:privacy:delme": "برای «حذف من»، همین دستور را در گروه بزن.",
+        }
+        await panel_edit(context, msg, user_id, hints.get(data, "اوکی"), [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    # مدیریت — لیست گروه‌ها (PV)
+    m = re.match(r"^adm:groups:(\d+)$", data)
+    if m:
+        page = int(m.group(1))
+        with SessionLocal() as s:
+            uid = q.from_user.id
+            if uid != OWNER_ID and not is_seller(s, uid):
+                await panel_edit(context, msg, user_id, "فقط مالک/فروشنده.", [[InlineKeyboardButton("بستن", callback_data="nav:close")]], root=False); return
+            groups = s.query(Group).order_by(Group.id.desc()).all()
+        page_size = 6
+        total = len(groups)
+        pages = max(1, math.ceil(total/page_size))
+        page = max(0, min(page, pages-1))
+        start = page*page_size
+        subset = groups[start:start+page_size]
+        rows=[]
+        for g in subset:
+            ex = fmt_dt_fa(g.expires_at) if g.expires_at else "نامشخص"
+            rows.append([InlineKeyboardButton(f"{g.title} — {fa_digits(g.id)} — {ex}", callback_data=f"adm:g:{g.id}")])
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("◀️", callback_data=f"adm:groups:{page-1}"))
+        if page<pages-1: nav.append(InlineKeyboardButton("▶️", callback_data=f"adm:groups:{page+1}"))
+        if nav: rows.append(nav)
+        await panel_edit(context, msg, user_id, f"📋 لیست گروه‌ها (صفحه {fa_digits(page+1)}/{fa_digits(pages)})", rows or [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)
+        return
+
+    m = re.match(r"^adm:g:(-?\d+)$", data)
+    if m:
+        target = int(m.group(1))
+        with SessionLocal() as s:
+            g = s.get(Group, target)
+        if not g:
+            await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
+        ex = g.expires_at and fmt_dt_fa(g.expires_at)
+        title = f"🧩 پنل گروه: {g.title}\nchat_id: {g.id}\nانقضا: {ex or 'نامشخص'}"
+        kb = [
+            [InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{g.id}:30"),
+             InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{g.id}:90"),
+             InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{g.id}:180")],
+            [InlineKeyboardButton("⛔️ صفر کردن شارژ", callback_data=f"chg:{g.id}:0")],
+            [InlineKeyboardButton("ℹ️ انقضا", callback_data="ui:expiry"),
+             InlineKeyboardButton("🚪 خروج ربات", callback_data=f"grp:{g.id}:leave")],
+            [InlineKeyboardButton("بازگشت به لیست", callback_data="adm:groups:0")],
+        ]
+        await panel_edit(context, msg, user_id, title, kb, root=False)
+        return
+
+    # فروشنده‌ها
+    if data == "adm:sellers":
+        with SessionLocal() as s:
+            uid = q.from_user.id
+            if uid != OWNER_ID:
+                await panel_edit(context, msg, user_id, "فقط مالک دسترسی دارد.", [[InlineKeyboardButton("بستن", callback_data="nav:close")]], root=False); return
+            sellers = s.query(Seller).order_by(Seller.id.asc()).all()
+        rows=[]
+        if sellers:
+            for sl in sellers[:50]:
+                cap = f"{sl.tg_user_id} | {'فعال' if sl.is_active else 'غیرفعال'}"
+                rows.append([InlineKeyboardButton(f"📈 آمار {cap}", callback_data=f"sl:stat:{sl.tg_user_id}"),
+                             InlineKeyboardButton("❌ عزل", callback_data=f"sl:del:{sl.tg_user_id}")])
+        rows.append([InlineKeyboardButton("➕ راهنمای افزودن فروشنده", callback_data="sl:add:help")])
+        await panel_edit(context, msg, user_id, "🛍️ لیست فروشنده‌ها", rows, root=False)
+        return
+
+    m = re.match(r"^sl:stat:(\d+)$", data)
+    if m:
+        sid = int(m.group(1))
+        with SessionLocal() as s:
+            rows = s.query(SubscriptionLog).filter(SubscriptionLog.actor_tg_user_id==sid).all()
+        total_ops = len(rows)
+        total_days = sum([r.amount_days or 0 for r in rows])
+        await panel_edit(context, msg, user_id, f"📈 آمار فروشنده {sid}\nتعداد عملیات: {fa_digits(total_ops)}\nمجموع روزهای شارژ: {fa_digits(total_days)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    m = re.match(r"^sl:del:(\d+)$", data)
+    if m:
+        sid = int(m.group(1))
+        with SessionLocal() as s:
+            if user_id != OWNER_ID:
+                await panel_edit(context, msg, user_id, "فقط مالک می‌تواند.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
+            ex = s.execute(select(Seller).where(Seller.tg_user_id==sid)).scalar_one_or_none()
+            if not ex:
+                await panel_edit(context, msg, user_id, "فروشنده پیدا نشد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
+            ex.is_active = False; s.commit()
+        await panel_edit(context, msg, user_id, "🗑️ فروشنده عزل شد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    if data == "sl:add:help":
+        txt = "برای افزودن فروشنده (فقط مالک):\n«افزودن فروشنده 123456789 یادداشت‌اختیاری»\nبرای عزل: «حذف فروشنده 123456789»"
+        await panel_edit(context, msg, user_id, txt, [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
+    # پیش‌فرض
+    await panel_edit(context, msg, user_id, "دستور ناشناخته یا منقضی.", [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)
 
 # ================== INSTALL/UNINSTALL REPORTS ==================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1042,7 +1361,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as s:
             g = ensure_group(s, chat)
             if new_status in ("member","administrator"):
-                # معرفی و راهنما در ورود
                 try:
                     await context.bot.send_message(
                         chat.id,
@@ -1055,9 +1373,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try_send_owner(f"➖ ربات از گروه حذف شد:\n• {chat.title}\n• chat_id: {chat.id}")
 
 # ================== JOBS ==================
-# (بدون تغییر نسبت به نسخهٔ قبلی)
-# ... job_midnight و job_morning همان هستند ...
-
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
         groups = s.query(Group).all()
@@ -1154,7 +1469,7 @@ def main():
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
-    app.add_handler(CallbackQueryHandler(on_callback))  # on_callback همان فایل قبلی (بدون تغییر)
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(error_handler)
 
@@ -1173,10 +1488,6 @@ def main():
                         allowed_updates=allowed, drop_pending_updates=True)
     else:
         app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
-
-# ====== on_callback از نسخهٔ قبل ======
-# برای جلوگیری از طول پاسخ، همان on_callback طولانی قبلی را بدون تغییر نگه دار.
-# اگر می‌خواهی همین‌جا هم تکرار کنم، بگو تا کل فایل با on_callback هم کپی کنم.
 
 if __name__ == "__main__":
     main()
