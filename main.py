@@ -1,16 +1,16 @@
-import os, logging, re, random, datetime as dt
-from typing import Optional, List
+import os, logging, re, random, datetime as dt, asyncio
+from typing import Optional, List, Tuple, Dict
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
-from sqlalchemy import create_engine, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey
+from sqlalchemy import create_engine, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey, UniqueConstraint, Index
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, MessageHandler, CallbackQueryHandler, ChatMemberHandler,
-    filters, ContextTypes
+    CommandHandler, filters, ContextTypes
 )
 
 # -------------------- CONFIG --------------------
@@ -34,7 +34,6 @@ def _mask_url(u: str) -> str:
         pass
     return "<unparsable>"
 
-# 1) Read DATABASE_URL or build from PG* vars
 raw_db_url = (os.getenv("DATABASE_URL") or "").strip()
 if not raw_db_url:
     PGHOST = os.getenv("PGHOST")
@@ -48,8 +47,6 @@ if not raw_db_url:
         raise RuntimeError("DATABASE_URL یافت نشد و متغیرهای PGHOST/PGUSER/PGPASSWORD هم ست نیستند.")
 
 db_url = raw_db_url
-
-# 2) driver & sslmode
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
 elif db_url.startswith("postgresql://"):
@@ -58,23 +55,19 @@ if "sslmode=" not in db_url:
     sep = "&" if "?" in db_url else "?"
     db_url = f"{db_url}{sep}sslmode=require"
 
-# 3) validate host
 try:
     parsed = _up.urlsplit(db_url)
     host_ok = bool(parsed.hostname)
     logging.info(f"DB host: {parsed.hostname}, port: {parsed.port}, db: {parsed.path}")
 except Exception:
     host_ok = False
-    logging.info("DB URL parsed = <error>")
 if not host_ok:
     masked = _mask_url(raw_db_url)
     raise RuntimeError(
         "DATABASE_URL نامعتبر است (هاست ندارد). مقدار فعلی (بدون پسورد): "
-        f"{masked}\n"
-        "در Railway از Postgres → Connect → External Connection String کپی کن و با کلید DATABASE_URL در سرویس ربات ست کن."
+        f"{masked}\nاز Postgres → Connect → External Connection String کپی کن و با کلید DATABASE_URL ست کن."
     )
 
-# 4) engine
 engine = create_engine(
     db_url,
     pool_pre_ping=True,
@@ -97,6 +90,10 @@ class Group(Base):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_chat_username", "chat_id", "username"),
+        Index("ix_users_chat_tg", "chat_id", "tg_user_id", unique=True),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     tg_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
@@ -108,6 +105,9 @@ class User(Base):
 
 class Relationship(Base):
     __tablename__ = "relationships"
+    __table_args__ = (
+        Index("ix_rel_unique", "chat_id", "user_a_id", "user_b_id", unique=True),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     user_a_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -116,6 +116,9 @@ class Relationship(Base):
 
 class Crush(Base):
     __tablename__ = "crushes"
+    __table_args__ = (
+        Index("ix_crush_unique", "chat_id", "from_user_id", "to_user_id", unique=True),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     from_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -124,6 +127,9 @@ class Crush(Base):
 
 class ReplyStatDaily(Base):
     __tablename__ = "reply_stat_daily"
+    __table_args__ = (
+        Index("ix_reply_chat_date_user", "chat_id", "date", "target_user_id", unique=True),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     date: Mapped[dt.date] = mapped_column(Date, index=True)
@@ -132,6 +138,9 @@ class ReplyStatDaily(Base):
 
 class ShipHistory(Base):
     __tablename__ = "ship_history"
+    __table_args__ = (
+        Index("ix_ship_chat_date", "chat_id", "date"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     date: Mapped[dt.date] = mapped_column(Date, index=True)
@@ -155,6 +164,17 @@ class Seller(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 Base.metadata.create_all(bind=engine)
+
+# ایندکس‌ها/یونیک‌ها (ایمن برای بار اول)
+with engine.begin() as conn:
+    conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_rel_unique ON relationships (chat_id, user_a_id, user_b_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_crush_unique ON crushes (chat_id, from_user_id, to_user_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_reply_chat_date_user ON reply_stat_daily (chat_id, date, target_user_id);
+        CREATE INDEX IF NOT EXISTS ix_users_chat_username ON users (chat_id, username);
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_users_chat_tg ON users (chat_id, tg_user_id);
+        CREATE INDEX IF NOT EXISTS ix_ship_chat_date ON ship_history (chat_id, date);
+    """))
 
 # -------------------- HELPERS --------------------
 def get_tz(group: Group) -> ZoneInfo:
@@ -234,9 +254,14 @@ def mention_of(u: 'User') -> str:
     name = u.first_name or "کاربر"
     return f'<a href="tg://user?id={u.tg_user_id}">{name}</a>'
 
+# -------------------- IN-MEMORY STATE --------------------
+PENDING_REL: Dict[Tuple[int,int], Dict] = {}   # key=(chat_id, actor_tg_id) -> {"target_user_id": int}
+TAG_DELAY_SECONDS = 0.8                         # برای جلوگیری از Flood
+
 # -------------------- PATTERNS --------------------
 PAT_GROUP = {
     "help": re.compile(r"^(?:فضول کمک|راهنما|کمک)$"),
+    "menu": re.compile(r"^(?:منو|فضول منو)$"),
     "gender": re.compile(r"^ثبت جنسیت (دختر|پسر)$"),
     "birthday_set": re.compile(r"^ثبت تولد (\d{4}-\d{2}-\d{2})$"),
     "birthday_del": re.compile(r"^حذف تولد$"),
@@ -251,18 +276,61 @@ PAT_GROUP = {
     "tag_girls": re.compile(r"^تگ دخترها$"),
     "tag_boys": re.compile(r"^تگ پسرها$"),
     "tag_all": re.compile(r"^تگ همه$"),
+    "privacy_me": re.compile(r"^حذف من$"),
+    "privacy_info": re.compile(r"^(?:داده(?:‌| )های من|حریم خصوصی)$"),
+    "wipe_group": re.compile(r"^پاکسازی گروه$"),
 }
 
 PAT_DM = {
-    "panel": re.compile(r"^(?:پنل|مدیریت)$"),
+    "panel": re.compile(r"^(?:پنل|مدیریت|کمک)$"),
     "groups": re.compile(r"^گروه‌ها$"),
-    "extend": re.compile(r"^تمدید (\-?\d+)\s+(\d+)$"),  # تمدید <chat_id> <days>
-    "set_tz": re.compile(r"^تنظیم زمان (\-?\d+)\s+([\w\/]+)$"),  # تنظیم زمان <chat_id> <Area/City>
+    "extend": re.compile(r"^تمدید (\-?\d+)\s+(\d+)$"),
+    "set_tz": re.compile(r"^تنظیم زمان (\-?\d+)\s+([\w\/]+)$"),
     "add_seller": re.compile(r"^افزودن فروشنده (\d+)(?:\s+(.+))?$"),
     "del_seller": re.compile(r"^حذف فروشنده (\d+)$"),
     "list_sellers": re.compile(r"^لیست فروشنده‌ها$"),
-    "help": re.compile(r"^کمک$"),
 }
+
+# -------------------- UI BUILDERS --------------------
+def build_group_menu(is_admin: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("👤 ثبت جنسیت", callback_data="ui:gset")],
+        [InlineKeyboardButton("🎂 ثبت تولد", callback_data="ui:bd:start")],
+        [InlineKeyboardButton("💘 ثبت کراش (روی ریپلای)", callback_data="ui:crush:add"),
+         InlineKeyboardButton("🗑️ حذف کراش (روی ریپلای)", callback_data="ui:crush:del")],
+        [InlineKeyboardButton("💞 ثبت رابطه (روی ریپلای)", callback_data="ui:rel:add"),
+         InlineKeyboardButton("🗑️ حذف رابطه (روی ریپلای)", callback_data="ui:rel:del")],
+        [InlineKeyboardButton("👑 محبوب امروز", callback_data="ui:pop"),
+         InlineKeyboardButton("💫 شیپ امشب", callback_data="ui:ship")],
+        [InlineKeyboardButton("🏷️ تگ دخترها", callback_data="ui:tag:girls"),
+         InlineKeyboardButton("🏷️ تگ پسرها", callback_data="ui:tag:boys")],
+        [InlineKeyboardButton("🏷️ تگ همه", callback_data="ui:tag:all")],
+        [InlineKeyboardButton("🔐 داده‌های من", callback_data="ui:privacy:me"),
+         InlineKeyboardButton("🗑️ حذف من", callback_data="ui:privacy:delme")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton("⚡️ شارژ گروه", callback_data="ui:charge:open"),
+                     InlineKeyboardButton("🧹 پاکسازی گروه", callback_data="ui:wipe:confirm")])
+    return InlineKeyboardMarkup(rows)
+
+def build_owner_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 گروه‌ها", callback_data="adm:groups")],
+        [InlineKeyboardButton("🛍️ لیست فروشنده‌ها", callback_data="adm:sellers")],
+        [InlineKeyboardButton("ℹ️ راهنما", callback_data="adm:help")],
+    ])
+
+# -------------------- COMMANDS --------------------
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return await update.message.reply_text("سلام! در گروه «فضول منو» یا «فضول کمک» بزن.")
+    with SessionLocal() as s:
+        if update.effective_user.id == OWNER_ID:
+            return await update.message.reply_text("👑 پنل مالک", reply_markup=build_owner_panel())
+        elif is_seller(s, update.effective_user.id):
+            return await update.message.reply_text("🛍️ پنل فروشنده", reply_markup=build_owner_panel())
+        else:
+            return await update.message.reply_text("سلام! برای مدیریت باید مالک/فروشنده باشی. برای راهنما «کمک» بفرست.")
 
 # -------------------- GROUP HANDLER --------------------
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,22 +338,19 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = clean_text(update.message.text)
 
-    if PAT_GROUP["help"].match(text):
-        return await update.message.reply_text(
-            "🕵️‍♂️ دستورات گروه (بدون /):\n"
-            "• ثبت جنسیت دختر|پسر\n"
-            "• ثبت تولد YYYY-MM-DD | حذف تولد\n"
-            "• ثبت رابطه @username YYYY-MM-DD | حذف رابطه @username\n"
-            "• ثبت کراش (با ریپلای) | حذف کراش (با ریپلای)\n"
-            "• محبوب امروز | شیپ امشب | فضول انقضا | فضول شارژ\n"
-            "• تگ دخترها | تگ پسرها | تگ همه  (با ریپلای روی یک پیام)\n"
-            "ℹ️ فقط به همین دستورات پاسخ می‌دم."
-        )
-
     with SessionLocal() as s:
         g = ensure_group(s, update.effective_chat)
 
-        # ثبت جنسیت
+    if PAT_GROUP["help"].match(text) or PAT_GROUP["menu"].match(text):
+        with SessionLocal() as s:
+            admin = is_admin(s, update.effective_user.id)
+        await update.message.reply_text("🕹 منوی فضول:", reply_markup=build_group_menu(admin))
+        return
+
+    # دستورات متنی قدیمی همچنان پشتیبانی (فقط روی همین‌ها پاسخ می‌دهیم)
+    with SessionLocal() as s:
+        g = ensure_group(s, update.effective_chat)
+
         if m := PAT_GROUP["gender"].match(text):
             if not await require_active_or_warn(update, context, s, g): return
             gender = "female" if m.group(1)=="دختر" else "male"
@@ -293,7 +358,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u.gender = gender; s.commit()
             return await update.message.reply_text("ثبت شد ✅")
 
-        # تولد
         if m := PAT_GROUP["birthday_set"].match(text):
             if not await require_active_or_warn(update, context, s, g): return
             try: d = dt.date.fromisoformat(m.group(1))
@@ -307,7 +371,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u.birthday = None; s.commit()
             return await update.message.reply_text("تولد حذف شد 🗑️")
 
-        # رابطه
         if m := PAT_GROUP["relation_set"].match(text):
             if not await require_active_or_warn(update, context, s, g): return
             target_username, date_str = m.group(1), m.group(2)
@@ -316,13 +379,14 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             me = upsert_user(s, g.id, update.effective_user)
             to = s.execute(select(User).where(User.chat_id==g.id, User.username==target_username)).scalar_one_or_none()
             if not to: return await update.message.reply_text("کاربر هدف پیدا نشد.")
+            # حذف قبلی در هر ترتیب
             s.execute(Relationship.__table__.delete().where(
                 (Relationship.chat_id==g.id) & (
                     ((Relationship.user_a_id==me.id) & (Relationship.user_b_id==to.id)) |
                     ((Relationship.user_a_id==to.id) & (Relationship.user_b_id==me.id))
                 )
             ))
-            s.add(Relationship(chat_id=g.id, user_a_id=me.id, user_b_id=to.id, started_at=started)); s.commit()
+            s.add(Relationship(chat_id=g.id, user_a_id=min(me.id,to.id), user_b_id=max(me.id,to.id), started_at=started)); s.commit()
             return await update.message.reply_text("رابطه ثبت شد 💞")
 
         if m := PAT_GROUP["relation_del"].match(text):
@@ -338,20 +402,22 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )); s.commit()
             return await update.message.reply_text("رابطه حذف شد 🗑️")
 
-        # کراش
         if PAT_GROUP["crush_add"].match(text):
             if not update.message.reply_to_message:
-                return await update.message.reply_text("برای ثبت کراش، روی پیام طرف ریپلای کن و بنویس: «ثبت کراش»")
+                return await update.message.reply_text("روی پیام طرف ریپلای کن و بنویس «ثبت کراش» یا از منو دکمه را بزن.")
             if not await require_active_or_warn(update, context, s, g): return
             me = upsert_user(s, g.id, update.effective_user)
             to = upsert_user(s, g.id, update.message.reply_to_message.from_user)
             if me.id == to.id: return await update.message.reply_text("روی خودت نمی‌شه 😅")
-            s.add(Crush(chat_id=g.id, from_user_id=me.id, to_user_id=to.id)); s.commit()
-            return await update.message.reply_text("کراش ثبت شد 💘")
+            try:
+                s.add(Crush(chat_id=g.id, from_user_id=me.id, to_user_id=to.id)); s.commit()
+                return await update.message.reply_text("کراش ثبت شد 💘")
+            except Exception:
+                return await update.message.reply_text("از قبل ثبت شده بود.")
 
         if PAT_GROUP["crush_del"].match(text):
             if not update.message.reply_to_message:
-                return await update.message.reply_text("برای حذف، روی پیام طرف ریپلای کن و بنویس: «حذف کراش»")
+                return await update.message.reply_text("روی پیام طرف ریپلای کن و بنویس «حذف کراش» یا از منو دکمه را بزن.")
             me = upsert_user(s, g.id, update.effective_user)
             to = upsert_user(s, g.id, update.message.reply_to_message.from_user)
             s.execute(Crush.__table__.delete().where(
@@ -359,7 +425,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )); s.commit()
             return await update.message.reply_text("کراش حذف شد 🗑️")
 
-        # محبوب امروز
         if PAT_GROUP["popular_today"].match(text):
             tz = get_tz(g); today = dt.datetime.now(tz).date()
             rows = s.execute(select(ReplyStatDaily).where(
@@ -373,7 +438,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{i}) {name} — {r.reply_count} ریپلای")
             return await update.message.reply_text("👑 محبوب‌های امروز:\n" + "\n".join(lines))
 
-        # شیپ امشب (نمایش آخرین)
         if PAT_GROUP["ship_tonight"].match(text):
             tz = get_tz(g); today = dt.datetime.now(tz).date()
             last = s.execute(select(ShipHistory).where(
@@ -385,50 +449,78 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💘 شیپِ امشب: {(m.first_name or '@'+(m.username or ''))} × {(f.first_name or '@'+(f.username or ''))}"
             )
 
-        # انقضا
         if PAT_GROUP["expiry"].match(text):
             return await update.message.reply_text(f"⏳ اعتبار این گروه تا: {g.expires_at} UTC")
 
-        # شارژ (مالک یا فروشنده)
         if PAT_GROUP["charge"].match(text):
-            if not is_admin(s, update.effective_user.id):
-                return await update.message.reply_text("دسترسی نداری.")
+            with SessionLocal() as s2:
+                if not is_admin(s2, update.effective_user.id):
+                    return await update.message.reply_text("دسترسی نداری.")
+            chat_id = update.effective_chat.id
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("۳۰ روز", callback_data="chg:30"),
-                InlineKeyboardButton("۹۰ روز", callback_data="chg:90"),
-                InlineKeyboardButton("۱۸۰ روز", callback_data="chg:180"),
+                InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{chat_id}:30"),
+                InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{chat_id}:90"),
+                InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{chat_id}:180"),
             ]])
             return await update.message.reply_text("⌁ پنل شارژ گروه:", reply_markup=kb)
 
-        # تگ‌ها (با ریپلای، ۴تایی، ریپلای روی همان پیام)
         if PAT_GROUP["tag_girls"].match(text) or PAT_GROUP["tag_boys"].match(text) or PAT_GROUP["tag_all"].match(text):
             if not update.message.reply_to_message:
-                return await update.message.reply_text("برای تگ کردن، باید روی یک پیام ریپلای کنی.")
-            if PAT_GROUP["tag_girls"].match(text):
-                users = s.query(User).filter_by(chat_id=g.id, gender="female").all()
-                header = "تگ دخترها:"
-            elif PAT_GROUP["tag_boys"].match(text):
-                users = s.query(User).filter_by(chat_id=g.id, gender="male").all()
-                header = "تگ پسرها:"
-            else:
-                users = s.query(User).filter_by(chat_id=g.id).all()
-                header = "تگ همه:"
-            if not users: return await update.message.reply_text("کسی برای تگ پیدا نشد.")
+                return await update.message.reply_text("برای تگ کردن، روی یک پیام ریپلای کن.")
             reply_to = update.message.reply_to_message.message_id
+            with SessionLocal() as s2:
+                if PAT_GROUP["tag_girls"].match(text):
+                    users = s2.query(User).filter_by(chat_id=g.id, gender="female").all()
+                    header = "تگ دخترها:"
+                elif PAT_GROUP["tag_boys"].match(text):
+                    users = s2.query(User).filter_by(chat_id=g.id, gender="male").all()
+                    header = "تگ پسرها:"
+                else:
+                    users = s2.query(User).filter_by(chat_id=g.id).all()
+                    header = "تگ همه:"
+            if not users: return await update.message.reply_text("کسی برای تگ پیدا نشد.")
             await update.message.reply_text(header, reply_to_message_id=reply_to)
             mentions = [mention_of(u) for u in users]
             for pack in chunked(mentions, 4):
                 try:
                     await context.bot.send_message(
-                        chat_id=g.id,
-                        text=" ".join(pack),
-                        reply_to_message_id=reply_to,
-                        parse_mode=ParseMode.HTML,
+                        chat_id=g.id, text=" ".join(pack),
+                        reply_to_message_id=reply_to, parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True
                     )
+                    await asyncio.sleep(TAG_DELAY_SECONDS)
                 except Exception as e:
                     logging.info(f"Tag batch send failed: {e}")
             return
+
+        if PAT_GROUP["privacy_me"].match(text):
+            me_id = update.effective_user.id
+            with SessionLocal() as s2:
+                u = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==me_id)).scalar_one_or_none()
+                if not u: return await update.message.reply_text("اطلاعاتی از شما نداریم.")
+                # delete dependent rows
+                s2.execute(Crush.__table__.delete().where((Crush.chat_id==g.id) & ((Crush.from_user_id==u.id) | (Crush.to_user_id==u.id))))
+                s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==g.id) & ((Relationship.user_a_id==u.id) | (Relationship.user_b_id==u.id))))
+                s2.execute(ReplyStatDaily.__table__.delete().where((ReplyStatDaily.chat_id==g.id) & (ReplyStatDaily.target_user_id==u.id)))
+                s2.execute(User.__table__.delete().where((User.chat_id==g.id) & (User.id==u.id)))
+                s2.commit()
+            return await update.message.reply_text("✅ تمام داده‌های شما در این گروه حذف شد.")
+
+        if PAT_GROUP["privacy_info"].match(text):
+            me_id = update.effective_user.id
+            with SessionLocal() as s2:
+                u = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==me_id)).scalar_one_or_none()
+                if not u: return await update.message.reply_text("چیزی از شما ذخیره نشده.")
+                info = f"👤 نام: {u.first_name or ''} @{u.username or ''}\nجنسیت: {u.gender}\nتولد: {u.birthday or '-'}"
+            return await update.message.reply_text(info)
+
+        if PAT_GROUP["wipe_group"].match(text):
+            with SessionLocal() as s2:
+                if not is_admin(s2, update.effective_user.id):
+                    return await update.message.reply_text("فقط مالک/فروشنده می‌تواند.")
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🧹 تایید پاکسازی", callback_data=f"wipe:{g.id}"),
+                                        InlineKeyboardButton("انصراف", callback_data="noop")]])
+            return await update.message.reply_text("⚠️ مطمئنی کل داده‌های گروه حذف شود؟", reply_markup=kb)
 
     # شمارش ریپلای‌ها برای آمار (بی‌صدا)
     if update.message.reply_to_message:
@@ -446,7 +538,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.reply_count += 1
             s.commit()
 
-# -------------------- OWNER/SELLER DM PANEL --------------------
+# -------------------- PRIVATE (OWNER/SELLER) --------------------
 async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not update.message or not update.message.text:
         return
@@ -454,18 +546,10 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
         uid = update.effective_user.id
         if uid != OWNER_ID and not is_seller(s, uid):
-            return await update.message.reply_text("سلام! برای استفاده مدیریتی باید مالک یا فروشنده باشی.")
+            return await update.message.reply_text("برای مدیریت باید مالک/فروشنده باشی. «/start» یا «کمک» بزن.")
 
-        if PAT_DM["panel"].match(text) or PAT_DM["help"].match(text):
-            return await update.message.reply_text(
-                "🛠 پنل مدیریت:\n"
-                "• گروه‌ها → لیست گروه‌ها\n"
-                "• تمدید <chat_id> <days>\n"
-                "• تنظیم زمان <chat_id> <Area/City>\n"
-                "• لیست فروشنده‌ها\n"
-                "• افزودن فروشنده <user_id> [یادداشت]  (فقط مالک)\n"
-                "• حذف فروشنده <user_id>  (فقط مالک)"
-            )
+        if PAT_DM["panel"].match(text):
+            return await update.message.reply_text("🛠 پنل مدیریت:", reply_markup=build_owner_panel())
 
         if PAT_DM["groups"].match(text):
             groups = s.query(Group).order_by(Group.id.asc()).all()
@@ -474,7 +558,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             now = dt.datetime.utcnow()
             for g in groups[:100]:
                 status = "فعال ✅" if g.expires_at and g.expires_at > now else "منقضی ⛔️"
-                lines.append(f"{g.title}  | chat_id: {g.id} | تا: {g.expires_at} UTC | {status} | TZ: {g.timezone or '-'}")
+                lines.append(f"{g.title} | chat_id: {g.id} | تا: {g.expires_at} UTC | {status} | TZ: {g.timezone or '-'}")
             return await update.message.reply_text("\n".join(lines))
 
         if m := PAT_DM["extend"].match(text):
@@ -525,22 +609,327 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ex.is_active = False; s.commit()
             return await update.message.reply_text("🗑️ فروشنده غیرفعال شد.")
 
-# -------------------- CALLBACKS (Charge buttons) --------------------
+# -------------------- CALLBACKS --------------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data: return
-    await q.answer()
+    await q.answer(cache_time=0)
+
+    # --- Charge ---
     if q.data.startswith("chg:"):
-        days = int(q.data.split(":")[1])
+        _, chat_id_str, days_str = q.data.split(":")
+        target_chat_id = int(chat_id_str); days = int(days_str)
         with SessionLocal() as s:
             if not is_admin(s, q.from_user.id):
-                return await q.edit_message_text("دسترسی نداری.")
-            g = ensure_group(s, q.message.chat)
+                return await q.answer("دسترسی نداری.", show_alert=True)
+            g = s.get(Group, target_chat_id) or ensure_group(s, q.message.chat)
             base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
             g.expires_at = base + dt.timedelta(days=days)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=q.from_user.id, action="extend", amount_days=days))
             s.commit()
-        await q.edit_message_text(f"✅ تمدید شد تا {g.expires_at} UTC")
+        try:
+            await q.edit_message_text(f"✅ تمدید شد تا {g.expires_at} UTC")
+        except:
+            await q.answer(f"تمدید شد تا {g.expires_at} UTC", show_alert=True)
+        return
+
+    if q.data == "ui:charge:open":
+        chat_id = q.message.chat.id
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{chat_id}:30"),
+            InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{chat_id}:90"),
+            InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{chat_id}:180"),
+        ]])
+        return await q.edit_message_reply_markup(reply_markup=kb)
+
+    # --- Owner panel quicks ---
+    if q.data == "adm:groups":
+        with SessionLocal() as s:
+            if q.from_user.id != OWNER_ID and not is_seller(s, q.from_user.id):
+                return await q.answer("دسترسی نداری.", show_alert=True)
+            groups = s.query(Group).order_by(Group.id.asc()).all()
+        if not groups:
+            return await q.message.reply_text("گروهی ثبت نشده.")
+        now = dt.datetime.utcnow()
+        lines = [f"{g.title} | {g.id} | {'فعال ✅' if g.expires_at and g.expires_at>now else 'منقضی ⛔️'} | {g.expires_at} UTC" for g in groups[:100]]
+        return await q.message.reply_text("\n".join(lines))
+
+    if q.data == "adm:sellers":
+        with SessionLocal() as s:
+            if q.from_user.id != OWNER_ID and not is_seller(s, q.from_user.id):
+                return await q.answer("دسترسی نداری.", show_alert=True)
+            sellers = s.query(Seller).order_by(Seller.id.asc()).all()
+        if not sellers:
+            return await q.message.reply_text("هیچ فروشنده‌ای ثبت نشده.")
+        lines = [f"{x.id}) {x.tg_user_id} | {'فعال' if x.is_active else 'غیرفعال'} | {x.note or ''}" for x in sellers]
+        return await q.message.reply_text("\n".join(lines))
+
+    if q.data == "adm:help":
+        return await q.message.reply_text("دستورات: گروه‌ها | تمدید <chat_id> <days> | تنظیم زمان <chat_id> <Area/City> | لیست فروشنده‌ها | افزودن/حذف فروشنده")
+
+    # --- Group menu actions ---
+    if q.data == "ui:gset":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👧 دختر", callback_data="gset:female"),
+             InlineKeyboardButton("👦 پسر", callback_data="gset:male")]
+        ])
+        return await q.edit_message_reply_markup(reply_markup=kb)
+
+    if q.data.startswith("gset:"):
+        gender = q.data.split(":")[1]
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            u = upsert_user(s, g.id, q.from_user)
+            u.gender = "female" if gender=="female" else "male"
+            s.commit()
+        return await q.answer("ثبت شد ✅", show_alert=False)
+
+    # --- Birthday wizard ---
+    def _year_page(start_year: int) -> InlineKeyboardMarkup:
+        years = [start_year+i for i in range(-8, 9)]
+        rows = []
+        for i in range(0, len(years), 3):
+            chunk = years[i:i+3]
+            rows.append([InlineKeyboardButton(str(y), callback_data=f"bd:y:{y}") for y in chunk])
+        rows.append([InlineKeyboardButton("⏪", callback_data=f"bd:yp:{years[0]-17}"),
+                     InlineKeyboardButton("انصراف", callback_data="bd:cancel"),
+                     InlineKeyboardButton("⏩", callback_data=f"bd:yn:{years[-1]+17}")])
+        return InlineKeyboardMarkup(rows)
+
+    def _month_kb(year: int) -> InlineKeyboardMarkup:
+        rows = []
+        for r in (1,4,7,10):
+            rows.append([InlineKeyboardButton(f"{m:02d}", callback_data=f"bd:m:{year}:{m}") for m in range(r, r+3)])
+        rows.append([InlineKeyboardButton("↩️ سال", callback_data="ui:bd:start")])
+        return InlineKeyboardMarkup(rows)
+
+    def _days_kb(year:int, month:int) -> InlineKeyboardMarkup:
+        import calendar
+        nd = calendar.monthrange(year, month)[1]
+        rows = []
+        row=[]
+        for d in range(1, nd+1):
+            row.append(InlineKeyboardButton(f"{d:02d}", callback_data=f"bd:d:{year}:{month}:{d}"))
+            if len(row)==7: rows.append(row); row=[]
+        if row: rows.append(row)
+        rows.append([InlineKeyboardButton("↩️ ماه", callback_data=f"bd:m:{year}:{month}")])
+        return InlineKeyboardMarkup(rows)
+
+    if q.data in ("ui:bd:start","bd:start"):
+        return await q.edit_message_reply_markup(reply_markup=_year_page(dt.datetime.utcnow().year-5))
+
+    if q.data.startswith("bd:yp:") or q.data.startswith("bd:yn:"):
+        base = int(q.data.split(":")[2])
+        return await q.edit_message_reply_markup(reply_markup=_year_page(base))
+
+    if q.data.startswith("bd:y:"):
+        y = int(q.data.split(":")[2])
+        return await q.edit_message_reply_markup(reply_markup=_month_kb(y))
+
+    if q.data.startswith("bd:m:"):
+        parts = q.data.split(":")
+        if len(parts)==4:
+            y = int(parts[2]); m = int(parts[3])
+            return await q.edit_message_reply_markup(reply_markup=_days_kb(y,m))
+        return await q.edit_message_reply_markup(reply_markup=_month_kb(int(parts[2])))
+
+    if q.data.startswith("bd:d:"):
+        _,_, y,m,d = q.data.split(":")
+        Y,M,D = int(y), int(m), int(d)
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            u = upsert_user(s, g.id, q.from_user)
+            u.birthday = dt.date(Y,M,D); s.commit()
+        await q.answer("تولد ثبت شد 🎂", show_alert=True)
+        try:
+            await q.edit_message_text(f"🎂 تاریخ تولد شما: {Y:04d}-{M:02d}-{D:02d}")
+        except: pass
+        return
+
+    if q.data == "bd:cancel":
+        return await q.answer("لغو شد", show_alert=False)
+
+    # --- Crush via button (requires reply) ---
+    if q.data == "ui:crush:add":
+        if not q.message or not q.message.reply_to_message:
+            return await q.answer("روی پیام طرف ریپلای کن و دوباره بزن.", show_alert=True)
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            if not group_active(g):
+                return await q.answer("اعتبار گروه تمام شده.", show_alert=True)
+            me = upsert_user(s, g.id, q.from_user)
+            to = upsert_user(s, g.id, q.message.reply_to_message.from_user)
+            if me.id == to.id: return await q.answer("روی خودت نمی‌شه 😅", show_alert=True)
+            try:
+                s.add(Crush(chat_id=g.id, from_user_id=me.id, to_user_id=to.id)); s.commit()
+                return await q.answer("کراش ثبت شد 💘", show_alert=True)
+            except Exception:
+                return await q.answer("قبلاً ثبت شده.", show_alert=True)
+
+    if q.data == "ui:crush:del":
+        if not q.message or not q.message.reply_to_message:
+            return await q.answer("روی پیام طرف ریپلای کن و دوباره بزن.", show_alert=True)
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            me = upsert_user(s, g.id, q.from_user)
+            to = upsert_user(s, g.id, q.message.reply_to_message.from_user)
+            s.execute(Crush.__table__.delete().where(
+                (Crush.chat_id==g.id) & (Crush.from_user_id==me.id) & (Crush.to_user_id==to.id)
+            )); s.commit()
+        return await q.answer("کراش حذف شد 🗑️", show_alert=True)
+
+    # --- Relationship via button (requires reply + date picker) ---
+    if q.data == "ui:rel:add":
+        if not q.message or not q.message.reply_to_message:
+            return await q.answer("روی پیام طرف ریپلای کن و دوباره بزن.", show_alert=True)
+        target_tg_id = q.message.reply_to_message.from_user.id
+        PENDING_REL[(q.message.chat.id, q.from_user.id)] = {"target_tg_id": target_tg_id}
+        # شروع انتخاب تاریخ
+        return await on_callback(type("obj",(object,),{"data":"ui:bd:start","message":q.message,"from_user":q.from_user,"answer":q.answer,"edit_message_reply_markup":q.edit_message_reply_markup})(), context)
+
+    if q.data == "ui:rel:del":
+        if not q.message or not q.message.reply_to_message:
+            return await q.answer("روی پیام طرف ریپلای کن و دوباره بزن.", show_alert=True)
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            me = upsert_user(s, g.id, q.from_user)
+            to = upsert_user(s, g.id, q.message.reply_to_message.from_user)
+            s.execute(Relationship.__table__.delete().where(
+                (Relationship.chat_id==g.id) & (
+                    ((Relationship.user_a_id==me.id) & (Relationship.user_b_id==to.id)) |
+                    ((Relationship.user_a_id==to.id) & (Relationship.user_b_id==me.id))
+                )
+            )); s.commit()
+        return await q.answer("رابطه حذف شد 🗑️", show_alert=True)
+
+    # اگر انتخاب روز تولد انجام شد و pending رابطه وجود دارد، همان تاریخ را برای رابطه ثبت کن
+    if q.data.startswith("bd:d:") and (q.message.chat.id, q.from_user.id) in PENDING_REL:
+        _,_, y,m,d = q.data.split(":")
+        Y,M,D = int(y), int(m), int(d)
+        pend = PENDING_REL.pop((q.message.chat.id, q.from_user.id), {})
+        target_tg_id = pend.get("target_tg_id")
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            me = upsert_user(s, g.id, q.from_user)
+            # پیدا کردن تارگت
+            to = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==target_tg_id)).scalar_one_or_none()
+            if not to: to = upsert_user(s, g.id, q.message.reply_to_message.from_user)  # fallback
+            s.execute(Relationship.__table__.delete().where(
+                (Relationship.chat_id==g.id) & (
+                    ((Relationship.user_a_id==me.id) & (Relationship.user_b_id==to.id)) |
+                    ((Relationship.user_a_id==to.id) & (Relationship.user_b_id==me.id))
+                )
+            ))
+            s.add(Relationship(chat_id=g.id, user_a_id=min(me.id,to.id), user_b_id=max(me.id,to.id), started_at=dt.date(Y,M,D)))
+            s.commit()
+        try:
+            await q.edit_message_text(f"💞 رابطه ثبت شد از تاریخ {Y:04d}-{M:02d}-{D:02d}")
+        except: pass
+        return
+
+    # --- Popular & Ship shortcuts ---
+    if q.data == "ui:pop":
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            tz = get_tz(g); today = dt.datetime.now(tz).date()
+            rows = s.execute(select(ReplyStatDaily).where(
+                (ReplyStatDaily.chat_id==g.id) & (ReplyStatDaily.date==today)
+            ).order_by(ReplyStatDaily.reply_count.desc()).limit(3)).scalars().all()
+            if not rows: return await q.answer("امروز آماری نداریم.", show_alert=True)
+            lines=[]
+            for i,r in enumerate(rows, start=1):
+                u = s.get(User, r.target_user_id)
+                name = u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
+                lines.append(f"{i}) {name} — {r.reply_count} ریپلای")
+        try:
+            await q.message.reply_text("👑 محبوب‌های امروز:\n" + "\n".join(lines))
+        except: pass
+        return
+
+    if q.data == "ui:ship":
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            tz = get_tz(g); today = dt.datetime.now(tz).date()
+            last = s.execute(select(ShipHistory).where(
+                (ShipHistory.chat_id==g.id) & (ShipHistory.date==today)
+            ).order_by(ShipHistory.id.desc())).scalar_one_or_none()
+        if not last:
+            return await q.answer("هنوز شیپ امشب ساخته نشده.", show_alert=True)
+        with SessionLocal() as s:
+            m, f = s.get(User, last.male_user_id), s.get(User, last.female_user_id)
+        try:
+            await q.message.reply_text(f"💘 شیپ امشب: {(m.first_name or '@'+(m.username or ''))} × {(f.first_name or '@'+(f.username or ''))}")
+        except: pass
+        return
+
+    # --- Tags via button (requires reply) ---
+    if q.data.startswith("ui:tag:"):
+        kind = q.data.split(":")[2]
+        if not q.message or not q.message.reply_to_message:
+            return await q.answer("برای تگ، روی پیام هدف ریپلای کن و دوباره بزن.", show_alert=True)
+        reply_to = q.message.reply_to_message.message_id
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            if kind=="girls":
+                users = s.query(User).filter_by(chat_id=g.id, gender="female").all()
+            elif kind=="boys":
+                users = s.query(User).filter_by(chat_id=g.id, gender="male").all()
+            else:
+                users = s.query(User).filter_by(chat_id=g.id).all()
+        if not users: return await q.answer("کسی برای تگ موجود نیست.", show_alert=True)
+        mentions = [mention_of(u) for u in users]
+        await q.answer("در حال تگ…", show_alert=False)
+        for pack in chunked(mentions, 4):
+            try:
+                await q.bot.send_message(q.message.chat.id, " ".join(pack),
+                                         reply_to_message_id=reply_to,
+                                         parse_mode=ParseMode.HTML,
+                                         disable_web_page_preview=True)
+                await asyncio.sleep(TAG_DELAY_SECONDS)
+            except Exception as e:
+                logging.info(f"Tag batch send failed: {e}")
+        return
+
+    # --- Privacy buttons ---
+    if q.data == "ui:privacy:me":
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            u = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==q.from_user.id)).scalar_one_or_none()
+        if not u: return await q.answer("چیزی ذخیره نشده.", show_alert=True)
+        txt = f"👤 نام: {u.first_name or ''} @{u.username or ''}\nجنسیت: {u.gender}\nتولد: {u.birthday or '-'}"
+        return await q.message.reply_text(txt)
+
+    if q.data == "ui:privacy:delme":
+        with SessionLocal() as s:
+            g = ensure_group(s, q.message.chat)
+            u = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==q.from_user.id)).scalar_one_or_none()
+            if not u: return await q.answer("چیزی برای حذف نیست.", show_alert=True)
+            s.execute(Crush.__table__.delete().where((Crush.chat_id==g.id) & ((Crush.from_user_id==u.id) | (Crush.to_user_id==u.id))))
+            s.execute(Relationship.__table__.delete().where((Relationship.chat_id==g.id) & ((Relationship.user_a_id==u.id) | (Relationship.user_b_id==u.id))))
+            s.execute(ReplyStatDaily.__table__.delete().where((ReplyStatDaily.chat_id==g.id) & (ReplyStatDaily.target_user_id==u.id)))
+            s.execute(User.__table__.delete().where((User.chat_id==g.id) & (User.id==u.id)))
+            s.commit()
+        return await q.answer("✅ حذف شد.", show_alert=True)
+
+    # --- Wipe group ---
+    if q.data.startswith("wipe:"):
+        chat_id = int(q.data.split(":")[1])
+        with SessionLocal() as s:
+            if not is_admin(s, q.from_user.id):
+                return await q.answer("فقط مالک/فروشنده.", show_alert=True)
+            s.execute(Crush.__table__.delete().where(Crush.chat_id==chat_id))
+            s.execute(Relationship.__table__.delete().where(Relationship.chat_id==chat_id))
+            s.execute(ReplyStatDaily.__table__.delete().where(ReplyStatDaily.chat_id==chat_id))
+            s.execute(ShipHistory.__table__.delete().where(ShipHistory.chat_id==chat_id))
+            s.execute(User.__table__.delete().where(User.chat_id==chat_id))
+            s.commit()
+        try:
+            await q.edit_message_text("🧹 کل داده‌های این گروه پاک شد.")
+        except: pass
+        return
+
+    if q.data == "noop":
+        return await q.answer("لغو شد", show_alert=False)
 
 # -------------------- INSTALL/UNINSTALL REPORTS --------------------
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -558,14 +947,11 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- SCHEDULED JOBS --------------------
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
-    """هر شب: محبوب‌های امروز + شیپ شبانه برای گروه‌های فعال"""
     with SessionLocal() as s:
         groups = s.query(Group).all()
         for g in groups:
             if not group_active(g): continue
             tz = get_tz(g); today = dt.datetime.now(tz).date()
-
-            # محبوب‌های امروز
             top = s.execute(select(ReplyStatDaily).where(
                 (ReplyStatDaily.chat_id==g.id) & (ReplyStatDaily.date==today)
             ).order_by(ReplyStatDaily.reply_count.desc()).limit(3)).scalars().all()
@@ -578,8 +964,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(g.id, "🌙 گزارش آخر شب — محبوب‌های امروز:\n" + "\n".join(lines))
                 except: pass
-
-            # شیپ شبانه
+            # ship nightly
             males = s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females = s.query(User).filter_by(chat_id=g.id, gender="female").all()
             rels = s.query(Relationship).filter_by(chat_id=g.id).all()
@@ -596,20 +981,17 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                 except: pass
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
-    """صبح‌ها: تبریک تولد و ماهگرد روابط"""
     with SessionLocal() as s:
         groups = s.query(Group).all()
         for g in groups:
             if not group_active(g): continue
             tz = get_tz(g); today = dt.datetime.now(tz).date()
-            # تولد
             bdays = s.query(User).filter_by(chat_id=g.id).filter(User.birthday.isnot(None)).all()
             for u in bdays:
                 if u.birthday.month==today.month and u.birthday.day==today.day:
                     try:
                         await context.bot.send_message(g.id, f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}!")
                     except: pass
-            # ماهگرد
             rels = s.query(Relationship).filter_by(chat_id=g.id).all()
             for r in rels:
                 if r.started_at and r.started_at.day==today.day:
@@ -626,19 +1008,15 @@ def main():
         raise RuntimeError("TELEGRAM_TOKEN env var is required.")
     app = Application.builder().token(TOKEN).build()
 
-    # گروه (فقط متن، بدون /)
+    app.add_handler(CommandHandler("start", on_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
-    # پی‌وی مالک/فروشنده
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
-    # شارژ
     app.add_handler(CallbackQueryHandler(on_callback))
-    # گزارش نصب/خروج
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # زمان‌بندی‌ها (UTC سراسری) — با چک JobQueue
     jq = app.job_queue
     if jq is None:
-        logging.warning('JobQueue فعال نیست. برای فعال‌سازی: pip install "python-telegram-bot[job-queue]==21.6"')
+        logging.warning('JobQueue فعال نیست. نصب کن: pip install "python-telegram-bot[job-queue]==21.6"')
     else:
         jq.run_daily(job_morning, time=dt.time(6,0,0))
         jq.run_daily(job_midnight, time=dt.time(21,0,0))
