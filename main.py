@@ -1114,7 +1114,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.reply_count += 1
             s.commit()
 
-# ================== CALLBACKS ==================
+# ================== CALLBACKS ==================# ================== CALLBACKS ==================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
@@ -1338,7 +1338,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, f"🎂 تولد ثبت شد: {fmt_date_fa(gdate)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
         return
 
-    # ===== ثبت رابطه — ویزارد تاریخ بر مبنای user_id داخلی (جدید: relid:*) =====
+    # ===== ثبت رابطه — ویزارد تاریخ بر مبنای user_id داخلی (relid:*) =====
     m = re.match(r"^relid:yp:(\d+):(\d+)$", data)
     if m:
         uid = int(m.group(1)); start = int(m.group(2))
@@ -1425,61 +1425,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, f"@{uname} — تاریخ {fa_digits(yy)}/{fa_digits(mm)} — روز را انتخاب کن", rows, root=False)
         return
 
-# ===== ثبت رابطه — ویزارد تاریخ بر مبنای user_id داخلی (relid:*) =====
-m = re.match(r"^relid:yp:(\d+):(\d+)$", data)
-if m:
-    uid = int(m.group(1)); start = int(m.group(2))
-    years = list(range(start, start-16, -1))
-    rows=[]
-    for chunk in chunked(years, 4):
-        rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"relid:y:{uid}:{yy}") for yy in chunk])
-    rows.append([InlineKeyboardButton("قدیمی‌تر", callback_data=f"relid:yp:{uid}:{start-16}")])
-    await panel_edit(context, msg, user_id, "سال شمسی شروع رابطه را انتخاب کن", rows, root=False)
-    return
-
-m = re.match(r"^relid:y:(\d+):(\d+)$", data)
-if m:
-    uid = int(m.group(1)); yy = int(m.group(2))
-    rows=[]
-    for i in range(1, 13):
-        rows.append([InlineKeyboardButton(fa_digits(f"{i:02d}"), callback_data=f"relid:m:{uid}:{yy}:{i}")])
-    await panel_edit(context, msg, user_id, f"سال {fa_digits(yy)} — ماه را انتخاب کن", rows, root=False)
-    return
-
-m = re.match(r"^relid:m:(\d+):(\d+):(\d+)$", data)
-if m:
-    uid = int(m.group(1)); yy = int(m.group(2)); mm = int(m.group(3))
-    md = jalali_month_len(yy, mm)
-    rows=[]
-    for chunk in chunked(list(range(1, md+1)), 6):
-        rows.append([InlineKeyboardButton(fa_digits(f"{d:02d}"), callback_data=f"relid:d:{uid}:{yy}:{mm}:{d}") for d in chunk])
-    await panel_edit(context, msg, user_id, f"تاریخ {fa_digits(yy)}/{fa_digits(mm)} — روز را انتخاب کن", rows, root=False)
-    return
-
-m = re.match(r"^relid:d:(\d+):(\d+):(\d+):(\d+)$", data)
-if m:
-    uid = int(m.group(1)); yy = int(m.group(2)); mm = int(m.group(3)); dd = int(m.group(4))
-    try:
-        started = JalaliDate(yy, mm, dd).to_gregorian() if HAS_PTOOLS else dt.date(2000+yy%100, mm, dd)
-    except Exception:
-        await panel_edit(context, msg, user_id, "تاریخ نامعتبر شد. دوباره تلاش کن.", [[InlineKeyboardButton("برگشت", callback_data=f"relid:y:{uid}:{yy}")]], root=False)
-        return
-    with SessionLocal() as s:
-        me = upsert_user(s, chat_id, update.effective_user)
-        to = s.get(User, uid)
-        if not to:
-            await panel_edit(context, msg, user_id, "کاربر هدف پیدا نشد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+    m = re.match(r"^rel:d:(\w+):(\d+):(\d+):(\d+)$", data)
+    if m:
+        uname = m.group(1); yy, mm, dd = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        try:
+            started = JalaliDate(yy, mm, dd).to_gregorian() if HAS_PTOOLS else dt.date(2000+yy%100, mm, dd)
+        except Exception:
+            await panel_edit(context, msg, user_id, "تاریخ نامعتبر شد. دوباره تلاش کن.", [[InlineKeyboardButton("برگشت", callback_data=f"rel:y:{uname}:{yy}")]], root=False)
             return
-        s.execute(Relationship.__table__.delete().where(
-            (Relationship.chat_id==chat_id) & (
-                ((Relationship.user_a_id==me.id) & (Relationship.user_b_id==to.id)) |
-                ((Relationship.user_a_id==to.id) & (Relationship.user_b_id==me.id))
-            )
-        ))
-        s.add(Relationship(chat_id=chat_id, user_a_id=min(me.id,to.id), user_b_id=max(me.id,to.id), started_at=started))
-        s.commit()
-    await panel_edit(context, msg, user_id, f"💞 رابطه ثبت شد — تاریخ شمسی: {fa_digits(f'{yy}/{mm:02d}/{dd:02d}')}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
-    return
+        with SessionLocal() as s:
+            me = upsert_user(s, chat_id, update.effective_user)
+            to = s.execute(select(User).where(User.chat_id==chat_id, User.username==uname)).scalar_one_or_none()
+            if not to:
+                await panel_edit(context, msg, user_id, "کاربر هدف پیدا نشد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+                return
+            s.execute(Relationship.__table__.delete().where(
+                (Relationship.chat_id==chat_id) & (
+                    ((Relationship.user_a_id==me.id) & (Relationship.user_b_id==to.id)) |
+                    ((Relationship.user_a_id==to.id) & (Relationship.user_b_id==me.id))
+                )
+            ))
+            s.add(Relationship(chat_id=chat_id, user_a_id=min(me.id,to.id), user_b_id=max(me.id,to.id), started_at=started))
+            s.commit()
+        await panel_edit(context, msg, user_id, f"💞 رابطه ثبت شد — تاریخ شمسی: {fa_digits(f'{yy}/{mm:02d}/{dd:02d}')}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
     # راهنمای عملیات‌هایی که ریپلای می‌خواهند
     if data in ("ui:crush:add","ui:crush:del","ui:rel:help","ui:tag:girls","ui:tag:boys","ui:tag:all","ui:pop","ui:ship","ui:privacy:me","ui:privacy:delme","ui:shipme"):
         hints = {
@@ -1592,27 +1562,6 @@ if m:
 
     # پیش‌فرض
     await panel_edit(context, msg, user_id, "دستور ناشناخته یا منقضی.", [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)
-
-# ================== INSTALL/UNINSTALL REPORTS ==================
-async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.my_chat_member: return
-    chat = update.my_chat_member.chat
-    new_status = update.my_chat_member.new_chat_member.status
-    old_status = update.my_chat_member.old_chat_member.status
-    if chat.type in ("group","supergroup"):
-        with SessionLocal() as s:
-            g = ensure_group(s, chat)
-            if new_status in ("member","administrator"):
-                try:
-                    await context.bot.send_message(
-                        chat.id,
-                        footer(group_intro_text(context.bot.username)),
-                        reply_markup=contact_kb(bot_username=context.bot.username)
-                    )
-                except Exception: ...
-                try_send_owner(f"➕ ربات اضافه شد به گروه:\n• {chat.title}\n• chat_id: {chat.id}")
-            elif new_status in ("left","kicked") and old_status in ("member","administrator"):
-                try_send_owner(f"➖ ربات از گروه حذف شد:\n• {chat.title}\n• chat_id: {chat.id}")
 
 # ================== JOBS ==================
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
