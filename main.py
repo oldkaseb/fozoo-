@@ -1,3 +1,4 @@
+# main.py
 import os, logging, re, random, datetime as dt, asyncio, atexit, hashlib, urllib.parse as _up, math
 from typing import Optional, List, Tuple, Dict, Any
 from zoneinfo import ZoneInfo
@@ -16,7 +17,8 @@ from telegram.error import Conflict as TgConflict
 
 # ================== CONFIG ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logging.getLogger("httpx").setLevel(logging.WARNING)  # لاگ‌های پر سروصدا خاموش‌تر
+logging.getLogger("httpx").setLevel(logging.WARNING)   # خاموش‌تر کردن لاگ HTTP
+logging.getLogger("telegram").setLevel(logging.INFO)   # لاگ سبک تلگرام برای دیباگ
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -542,8 +544,6 @@ PAT_GROUP = {
     "bot_stats": re.compile(r"^(?:آمار فضول|فضول آمار|آمار ربات)$"),
     "admin_add": re.compile(r"^فضول ادمین(?: @?(\w+))?$"),
     "admin_del": re.compile(r"^حذف فضول ادمین(?: @?(\w+))?$"),
-    "seller_block": re.compile(r"^(?:مسدود فروشنده)(?: @?(\w+))?$"),
-    "seller_unblock": re.compile(r"^(?:آزاد فروشنده)(?: @?(\w+))?$"),
     "gender": re.compile(r"^ثبت جنسیت (دختر|پسر)$"),
     "birthday_wizard": re.compile(r"^ثبت تولد$"),
     "birthday_set": re.compile(r"^ثبت تولد ([\d\/\-]+)$"),
@@ -1172,18 +1172,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
     data = q.data or ""
-    user_id = q.from_user.id
     msg = q.message
-    chat_id = msg.chat.id if msg else None
+    if not msg:
+        await q.answer("پیام یافت نشد.", show_alert=True)
+        return
 
-    # مالکیت پنل
+    user_id = q.from_user.id
+    chat_id = msg.chat.id
     key = _panel_key(chat_id, msg.message_id)
+
+    # لاگ کال‌بک برای دیباگ
+    logging.info(f"[cb] chat={chat_id} user={user_id} data={data}")
+
+    # اگر state از بین رفته (مثلاً بعد از ری‌استارت)، خودمان بسازیم تا دکمه‌ها از کار نیفتند
     meta = PANELS.get(key)
     if not meta:
-        await q.answer("این پنل منقضی شده. دوباره بازش کن.", show_alert=True)
-        return
-    if meta.get("owner") != user_id:
-        await q.answer("این منو فقط برای کسی است که آن را باز کرده.", show_alert=True)
+        PANELS[key] = {"owner": user_id, "stack": []}
+        meta = PANELS[key]
+
+    # فقط صاحب منو اجازه دارد
+    owner_id = meta.get("owner")
+    if owner_id is not None and owner_id != user_id:
+        await q.answer("این منو مخصوص کسی است که آن را باز کرده.", show_alert=True)
         return
 
     await q.answer()
@@ -1223,6 +1233,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "⚙️ پیکربندی فضول", rows, root=False)
         return
 
+    if data == "cfg:sync":
+        added = await sync_group_admins(context.bot, chat_id)
+        await panel_edit(context, msg, user_id, f"✅ همگام شد. ادمین‌های جدید: {fa_digits(added)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
+        return
+
     # مشاهده انقضا
     if data == "ui:expiry":
         with SessionLocal() as s:
@@ -1252,7 +1267,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             g = s.get(Group, target_chat)
             if not g:
-                await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("باشه", callback_data="nav:back")]], root=False); return
+                await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
             if days <= 0:
                 g.expires_at = dt.datetime.utcnow()
                 s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="reset", amount_days=0))
@@ -1304,11 +1319,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mentions = [mention_by_tgid(s, chat_id, ga.tg_user_id) for ga in gas[:50]]
                 txt = "👥 ادمین‌های فضول:\n" + "\n".join(f"- {m}" for m in mentions)
         await panel_edit(context, msg, user_id, txt, [[InlineKeyboardButton("همگام‌سازی مجدد", callback_data="cfg:sync")]], root=False, parse_mode=ParseMode.HTML)
-        return
-
-    if data == "cfg:sync":
-        added = await sync_group_admins(context.bot, chat_id)
-        await panel_edit(context, msg, user_id, f"✅ همگام شد. ادمین‌های جدید: {fa_digits(added)}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
         return
 
     # ثبت جنسیت
@@ -1364,7 +1374,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows=[]
         for chunk in chunked(list(range(1, md+1)), 6):
             rows.append([InlineKeyboardButton(fa_digits(f"{d:02d}"), callback_data=f"bd:d:{yy}:{mm}:{d}") for d in chunk])
-        await panel_edit(context, msg, user_id, f"تاریخ: {fa_digits(yy)}/{fa_digits(mm):s} — روز را انتخاب کن", rows, root=False)
+        await panel_edit(context, msg, user_id, f"تاریخ: {fa_digits(yy)}/{fa_digits(mm)} — روز را انتخاب کن", rows, root=False)
         return
 
     m = re.match(r"^bd:d:(\d+):(\d+):(\d+)$", data)
@@ -1432,7 +1442,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ((Relationship.user_a_id==to.id) & (Relationship.user_b_id==me.id))
                 )
             ))
-            s.add(Relationship(chat_id=chat_id, user_a_id=min(me.id,to.id), user_b_id=max(me.id,to.id), started_at=started)); s.commit()
+            s.add(Relationship(chat_id=chat_id, user_a_id=min(me.id,to.id), user_b_id=max(me.id,to.id), started_at=started))
+            s.commit()
         await panel_edit(context, msg, user_id, f"💞 رابطه ثبت شد — تاریخ شمسی: {fa_digits(f'{yy}/{mm:02d}/{dd:02d}')}", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
         return
 
@@ -1446,8 +1457,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ui:tag:boys": "برای «تگ پسرها»، روی یک پیام ریپلای کن و بنویس: تگ پسرها",
             "ui:tag:all": "برای «تگ همه»، روی یک پیام ریپلای کن و بنویس: تگ همه",
             "ui:pop": "برای «محبوب امروز»، همین دستور را در گروه بزن.",
-            "ui:ship": "برای «شیپ امشب»، همین دستور را در گروه بزن.",
-            "ui:shipme": "برای «شیپم کن»، همین دستور را بزن تا یک پارتنر پیشنهادی معرفی شود.",
+            "ui:ship": "«شیپ امشب» آخر شب خودکار ارسال می‌شود.",
+            "ui:shipme": "«شیپم کن» را در گروه بزن تا یک پارتنر پیشنهادی معرفی شود.",
             "ui:privacy:me": "برای «حذف من»، همین دستور را در گروه بزن.",
             "ui:privacy:delme": "برای «حذف من»، همین دستور را در گروه بزن.",
         }
@@ -1647,7 +1658,6 @@ async def on_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     if not m: return
     txt = clean_text((m.text or m.caption or "") or "")
-    # فقط وقتی دقیقاً «فضول» باشد تا با «فضول منو/کمک» تداخل نکند
     if txt == "فضول":
         try:
             await m.reply_text("جانم 👂")
