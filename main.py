@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey, Index
 from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError, DBAPIError  # for watchdog
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -49,7 +50,6 @@ def fmt_dt_fa(dt_utc: Optional[dt.datetime], tz_name: Optional[str] = None) -> s
     if HAS_PTOOLS:
         try:
             jdt = JalaliDateTime.fromgregorian(datetime=local)
-            # نام روز + تاریخ و ساعت
             s = jdt.strftime("%A %Y/%m/%d %H:%M")
             return fa_digits(s) + " (تهران)"
         except Exception: ...
@@ -155,19 +155,30 @@ try:
 except Exception:
     pass
 
-engine = create_engine(db_url, pool_pre_ping=True, future=True, connect_args={"sslmode":"require"})
+engine = create_engine(
+    db_url,
+    pool_pre_ping=True,
+    pool_recycle=300,   # recycle stale conns (helps after DB restarts)
+    future=True,
+    connect_args={"sslmode":"require"}
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # --- Singleton guard (polling only one instance) ---
 SINGLETON_CONN = None
+SINGLETON_KEY = int(hashlib.blake2b((TOKEN or "no-token").encode(), digest_size=8).hexdigest(), 16) % (2**31)
+
+def _acquire_lock(conn, key: int) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+    ok = cur.fetchone()[0]
+    return bool(ok)
+
 def acquire_singleton_or_exit():
     global SINGLETON_CONN
-    key = int(hashlib.blake2b(TOKEN.encode(), digest_size=8).hexdigest(), 16) % (2**31)
     try:
         SINGLETON_CONN = engine.raw_connection()
-        cur = SINGLETON_CONN.cursor()
-        cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
-        ok = cur.fetchone()[0]
+        ok = _acquire_lock(SINGLETON_CONN, SINGLETON_KEY)
         if not ok:
             logging.error("Another instance is already running (PG advisory lock). Exiting.")
             os._exit(0)
@@ -180,7 +191,7 @@ def acquire_singleton_or_exit():
     def _unlock():
         try:
             cur = SINGLETON_CONN.cursor()
-            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+            cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
             SINGLETON_CONN.close()
         except Exception:
             pass
@@ -358,7 +369,7 @@ def add_nav(rows: List[List[InlineKeyboardButton]], root: bool=False) -> InlineK
 async def open_panel_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str, rows: List[List[InlineKeyboardButton]], root: bool, keep: bool=True):
     msg = await update.effective_chat.send_message(footer(title), reply_markup=add_nav(rows, root=root))
     PANELS[(msg.chat_id, msg.message_id)] = {"owner": update.effective_user.id}
-    if keep:  # پنل تا زمان بستن می‌ماند
+    if keep:
         pass
     else:
         schedule_autodelete(context, msg.chat_id, msg.message_id, keep=False)
@@ -442,7 +453,6 @@ PAT_DM = {
 # ================== /start ==================
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
-        # توضیح کوتاه در گروه
         txt = (
             "سلام! برای کار با ربات:\n"
             "• «فضول منو» → منوی دکمه‌ای\n"
@@ -519,19 +529,16 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         g = ensure_group(s, update.effective_chat)
         is_gadmin = is_group_admin(s, g.id, update.effective_user.id)
 
-    # منو
     if PAT_GROUP["menu"].match(text):
         title = "🕹 منوی فضول"
         rows = kb_group_menu(is_gadmin)
         await open_panel_from_text(update, context, title, rows, root=True, keep=True)
         return
 
-    # راهنما
     if PAT_GROUP["help"].match(text):
         await reply_temp(update, context, user_help_text())
         return
 
-    # پیکربندی
     if PAT_GROUP["config"].match(text):
         with SessionLocal() as s:
             if not is_group_admin(s, update.effective_chat.id, update.effective_user.id):
@@ -541,7 +548,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_panel_from_text(update, context, title, rows, root=True, keep=True)
         return
 
-    # ادمین اضافه/حذف (متنی)
     if PAT_GROUP["admin_add"].match(text) or PAT_GROUP["admin_del"].match(text):
         m_add = PAT_GROUP["admin_add"].match(text)
         m_del = PAT_GROUP["admin_del"].match(text)
@@ -573,7 +579,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_temp(update, context, "🗑️ ادمین گروه حذف شد.")
         return
 
-    # مسدود/آزاد فروشنده
     if PAT_GROUP["seller_block"].match(text) or PAT_GROUP["seller_unblock"].match(text):
         block = bool(PAT_GROUP["seller_block"].match(text))
         with SessionLocal() as s:
@@ -602,7 +607,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_temp(update, context, "✅ اعمال شد.")
         return
 
-    # ===== سایر دستورات کاربر (متنی) =====
     with SessionLocal() as s:
         g = ensure_group(s, update.effective_chat)
 
@@ -833,7 +837,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
                 [InlineKeyboardButton("🛍️ لیست فروشنده‌ها", callback_data="adm:sellers")] if uid==OWNER_ID else []
             ]
-            rows = [r for r in rows if r]  # remove empties
+            rows = [r for r in rows if r]
             await open_panel_from_text(update, context, who, rows, root=True, keep=True)
             return
 
@@ -914,7 +918,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _panel_owner_ok(q) -> bool:
     key = (q.message.chat.id, q.message.message_id)
     meta = PANELS.get(key)
-    if not meta:  # اگر پنلی نباشد، عبور (برای پیام‌های ناپنلی)
+    if not meta:
         return True
     if meta["owner"] != q.from_user.id:
         return False
@@ -927,12 +931,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("✅ کلیک ثبت شد", cache_time=0, show_alert=False)
     except Exception: ...
 
-    # فقط صاحب پنل
     if not _panel_owner_ok(q):
         await q.answer("این منو مخصوص کسی است که آن را باز کرده.", show_alert=True)
         return
 
-    # ناوبری پنل‌ها
     if q.data == "nav:close":
         try:
             PANELS.pop((q.message.chat.id, q.message.message_id), None)
@@ -940,19 +942,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: ...
         return
     if q.data == "nav:back":
-        # پنل فعلی را حذف کن؛ قبلی روی چت باقی‌ست
         try:
             PANELS.pop((q.message.chat.id, q.message.message_id), None)
             await q.message.delete()
         except Exception: ...
         return
 
-    # کمک کاربر
     if q.data == "usr:help":
         await q.message.chat.send_message(footer(user_help_text()))
         return
 
-    # پیکربندی
     if q.data == "cfg:open":
         with SessionLocal() as s:
             if not is_group_admin(s, q.message.chat.id, q.from_user.id):
@@ -962,7 +961,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_panel_from_cb(q.message, q.from_user.id, context, title, rows, root=True)
         return
 
-    # شارژ
     if q.data.startswith("chg:"):
         _, chat_id_str, days_str = q.data.split(":")
         target_chat_id = int(chat_id_str); days = int(days_str)
@@ -991,7 +989,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await open_panel_from_cb(q.message, q.from_user.id, context, "⌁ پنل شارژ گروه", kb, root=False)
         return
 
-    # لیست گروه‌ها
     if q.data.startswith("adm:groups"):
         parts = q.data.split(":")
         page = int(parts[2]) if len(parts)>=3 else 0
@@ -1051,7 +1048,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("خطا در خروج (ممکن است عضو نباشم).", show_alert=True)
             return
 
-    # فروشنده‌ها
     if q.data == "adm:sellers":
         with SessionLocal() as s:
             sellers = s.query(Seller).order_by(Seller.id.asc()).all()
@@ -1116,7 +1112,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 txt = "برای افزودن فروشنده: در همین چت بفرست:\n«افزودن فروشنده <tg_user_id> [یادداشت]»"
                 await q.message.chat.send_message(footer(txt)); return
 
-    # مدیران گروه
     if q.data == "ga:list":
         with SessionLocal() as s:
             if not is_group_admin(s, q.message.chat.id, q.from_user.id):
@@ -1130,7 +1125,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.chat.send_message(footer(txt))
         return
 
-    # جنسیت
     if q.data == "ui:gset":
         kb = [[InlineKeyboardButton("👧 دختر", callback_data="gset:female"),
                InlineKeyboardButton("👦 پسر", callback_data="gset:male")]]
@@ -1147,7 +1141,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("ثبت شد ✅", show_alert=True)
         return
 
-    # ثبت تولد با دکمه (پنل چند مرحله‌ای)
+    # ثبت تولد چندمرحله‌ای
     def _year_page(start_year: int) -> List[List[InlineKeyboardButton]]:
         years = [start_year+i for i in range(-8, 9)]
         rows = []
@@ -1245,9 +1239,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q.data == "ui:rel:add":
-        # انتخاب تاریخ در پنل جداگانه (سال/ماه/روز)
         await open_panel_from_cb(q.message, q.from_user.id, context, "تاریخ شروع رابطه را انتخاب کن:", _year_page(dt.datetime.utcnow().year-5), root=False)
-        # در مرحله انتخاب روز، داده‌ها را ثبت می‌کنیم (برای سادگی اینجا از ریپلای استفاده می‌کنیم)
         return
 
     if q.data == "ui:rel:del":
@@ -1376,7 +1368,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             g = ensure_group(s, q.message.chat)
         await q.answer(f"انقضا: {fmt_dt_fa(g.expires_at, g.timezone) if g.expires_at else 'نامشخص'}", show_alert=True); return
 
-    # پاکسازی گروه
     if q.data.startswith("wipe:"):
         chat_id = int(q.data.split(":")[1])
         with SessionLocal() as s:
@@ -1428,7 +1419,6 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(g.id, footer("🌙 محبوب‌های امروز:\n" + "\n".join(lines)))
                 except: ...
-            # شیپ فقط بین مجردها
             males = s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females = s.query(User).filter_by(chat_id=g.id, gender="female").all()
             rels = s.query(Relationship).filter_by(chat_id=g.id).all()
@@ -1451,7 +1441,6 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             if not group_active(g): continue
             tz = ZoneInfo(g.timezone or DEFAULT_TZ)
             jy, jm, jd = today_jalali(tz)
-            # تولدها (جلالی)
             bdays = s.query(User).filter_by(chat_id=g.id).filter(User.birthday.isnot(None)).all()
             for u in bdays:
                 um, ud = to_jalali_md(u.birthday)
@@ -1459,7 +1448,6 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         await context.bot.send_message(g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
                     except: ...
-            # ماهگرد رابطه‌ها (جلالی: روزِ شروع هر ماه)
             rels = s.query(Relationship).filter_by(chat_id=g.id).all()
             for r in rels:
                 if not r.started_at: continue
@@ -1471,6 +1459,30 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                             g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})")
                         )
                     except: ...
+
+# -------- Singleton Watchdog (re-acquire lock after DB restarts) --------
+async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
+    global SINGLETON_CONN
+    try:
+        cur = SINGLETON_CONN.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        return  # connection alive; lock session intact
+    except Exception as e:
+        logging.warning(f"Singleton connection ping failed, trying to re-acquire lock: {e}")
+        try:
+            try:
+                SINGLETON_CONN.close()
+            except Exception:
+                pass
+            SINGLETON_CONN = engine.raw_connection()
+            if not _acquire_lock(SINGLETON_CONN, SINGLETON_KEY):
+                logging.error("Lost advisory lock and another instance took it. Exiting.")
+                os._exit(0)
+            logging.info("Advisory lock re-acquired after DB restart.")
+        except Exception as e2:
+            logging.error(f"Failed to re-acquire advisory lock: {e2}")
+            # try again on next tick
 
 # ================== ERROR HANDLER ==================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1520,6 +1532,7 @@ def main():
     else:
         jq.run_daily(job_morning, time=dt.time(6,0,0))   # 6 UTC
         jq.run_daily(job_midnight, time=dt.time(21,0,0)) # 21 UTC ~ آخر شب ایران
+        jq.run_repeating(singleton_watchdog, interval=60, first=60)  # <— واچ‌داگ قفل
 
     logging.info("FazolBot running…")
     allowed = ["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"]
