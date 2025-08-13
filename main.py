@@ -1,4 +1,4 @@
-import os, logging, re, random, datetime as dt, asyncio
+import os, logging, re, random, datetime as dt, asyncio, atexit, hashlib
 from typing import Optional, List, Tuple, Dict
 from zoneinfo import ZoneInfo
 import urllib.parse as _up
@@ -21,6 +21,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Tehran")
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "40"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # خالی = Polling
+PORT = int(os.getenv("PORT", "8080"))
 
 Base = declarative_base()
 
@@ -166,6 +168,32 @@ if not host_ok:
 
 engine = create_engine(db_url, pool_pre_ping=True, future=True, connect_args={"sslmode":"require"})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+# --- Singleton guard: فقط یک نمونه اجازه‌ی Polling دارد ---
+SINGLETON_CONN = None
+def acquire_singleton_or_exit():
+    global SINGLETON_CONN
+    key = int(hashlib.blake2b(TOKEN.encode(), digest_size=8).hexdigest(), 16) % (2**31)
+    try:
+        SINGLETON_CONN = engine.raw_connection()
+        cur = SINGLETON_CONN.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+        ok = cur.fetchone()[0]
+        if not ok:
+            logging.error("Another instance is already running (PG advisory lock). Exiting.")
+            os._exit(0)
+    except Exception as e:
+        logging.error(f"Singleton lock failed: {e}")
+        os._exit(0)
+
+    @atexit.register
+    def _unlock():
+        try:
+            cur = SINGLETON_CONN.cursor()
+            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+            SINGLETON_CONN.close()
+        except Exception:
+            pass
 
 # ====== MODELS ======
 class Group(Base):
@@ -331,10 +359,8 @@ async def require_active_or_warn(update: Update, context: ContextTypes.DEFAULT_T
     return False
 
 def clean_text(s: str) -> str: return re.sub(r"\s+", " ", s.strip())
-
 def chunked(lst: List, n: int):
     for i in range(0, len(lst), n): yield lst[i:i+n]
-
 def mention_of(u: 'User') -> str:
     if u.username: return f"@{u.username}"
     name = u.first_name or "کاربر"
@@ -856,12 +882,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data: return
 
-    # پاسخ فوری تا مطمئن شوید «کلیک» کار می‌کند حتی اگر ادامهٔ پردازش به هر دلیلی خطا بدهد
     try:
         await q.answer("✅ کلیک ثبت شد", cache_time=0, show_alert=False)
     except Exception: ...
 
-    autodel_qmessage(context, q.message)  # تایمر حذف برای پیام پنل
+    autodel_qmessage(context, q.message)  # حذف خودکار پنل بعد از 40s
 
     if q.data == "usr:help":
         txt = (
@@ -1437,7 +1462,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             for r in rels:
                 if not r.started_at: continue
                 rm, rd = to_jalali_md(r.started_at)
-                if rd==jd:  # هر ماه، همان روز
+                if rd==jd:
                     ua, ub = s.get(User, r.user_a_id), s.get(User, r.user_b_id)
                     try:
                         await context.bot.send_message(
@@ -1445,21 +1470,32 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                         )
                     except: ...
 
+# ====== ERROR HANDLER ======
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logging.exception("Unhandled error", exc_info=context.error)
+
 # ====== BOOT ======
 async def _post_init(app: Application):
     try:
         info = await app.bot.get_webhook_info()
-        if info.url:
-            logging.info(f"Webhook was set to: {info.url} — deleting…")
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logging.info("Webhook deleted. Polling will receive ALL updates.")
+        if WEBHOOK_URL:
+            logging.info("Webhook mode enabled; leaving webhook to PTB in run_webhook.")
+        else:
+            if info.url:
+                logging.info(f"Webhook was set to: {info.url} — deleting…")
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            logging.info("Webhook deleted. Polling will receive ALL updates.")
     except Exception as e:
-        logging.warning(f"delete_webhook failed: {e}")
+        logging.warning(f"post_init webhook check failed: {e}")
     logging.info(f"PersianTools enabled: {HAS_PTOOLS}")
 
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN env var is required.")
+
+    # جلوگیری از اجرای هم‌زمان چند نمونه (409)
+    acquire_singleton_or_exit()
+
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", on_start))
@@ -1467,6 +1503,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_error_handler(error_handler)
 
     jq = app.job_queue
     if jq is None:
@@ -1476,11 +1513,18 @@ def main():
         jq.run_daily(job_midnight, time=dt.time(21,0,0)) # 21 UTC ~ حوالی آخر شب ایران
 
     logging.info("FazolBot running…")
-    # allowed_updates صریح: کالبک‌ها تضمینی دریافت می‌شن
-    app.run_polling(
-        allowed_updates=["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"],
-        drop_pending_updates=True
-    )
+    allowed = ["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"]
+    if WEBHOOK_URL:
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
+            allowed_updates=allowed,
+            drop_pending_updates=True
+        )
+    else:
+        app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
