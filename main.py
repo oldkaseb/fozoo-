@@ -1,11 +1,10 @@
 import os, logging, re, random, datetime as dt
 from typing import Optional, List
 from zoneinfo import ZoneInfo
-from dateutil.relativedelta import relativedelta
 
-from sqlalchemy import create_engine, select, and_
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
-from sqlalchemy import Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey
+from sqlalchemy import create_engine, Integer, BigInteger, String, DateTime, Date, Boolean, JSON, ForeignKey
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -20,19 +19,41 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Tehran")
 
-db_url = os.getenv("DATABASE_URL")
+# -------------------- DB (Railway + SSL Patch) --------------------
+import urllib.parse as _up
+Base = declarative_base()
+
+db_url = os.getenv("DATABASE_URL", "").strip()
 if not db_url:
     raise RuntimeError("DATABASE_URL env var is required (Railway PostgreSQL).")
+
+# تبدیل scheme به درایور psycopg2 برای SQLAlchemy
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
 elif db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-# -------------------- DB --------------------
-Base = declarative_base()
-engine = create_engine(db_url, pool_pre_ping=True, future=True)
+# اجباری کردن SSL برای Railway (اگر در URL نبود)
+if "sslmode=" not in db_url:
+    sep = "&" if "?" in db_url else "?"
+    db_url = f"{db_url}{sep}sslmode=require"
+
+# لاگ کوچک برای عیب‌یابی هاست/پورت/نام‌DB (بدون لو دادن پسورد)
+try:
+    parsed = _up.urlsplit(db_url)
+    logging.info(f"DB host: {parsed.hostname}, port: {parsed.port}, db: {parsed.path}")
+except Exception:
+    logging.info("DB URL parsed.")
+
+engine = create_engine(
+    db_url,
+    pool_pre_ping=True,
+    future=True,
+    connect_args={"sslmode": "require"},  # محکم‌کاری
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
+# -------------------- MODELS --------------------
 class Group(Base):
     __tablename__ = "groups"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # chat_id
@@ -105,9 +126,17 @@ class Seller(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# -------------------- Helpers --------------------
+# -------------------- HELPERS --------------------
 def get_tz(group: Group) -> ZoneInfo:
     return ZoneInfo(group.timezone or DEFAULT_TZ)
+
+def try_send_owner(text: str):
+    from telegram import Bot
+    if not TOKEN or not OWNER_ID: return
+    try:
+        Bot(TOKEN).send_message(OWNER_ID, text)
+    except Exception as e:
+        logging.info(f"Owner DM failed: {e}")
 
 def ensure_group(session, chat) -> Group:
     g = session.get(Group, chat.id)
@@ -122,18 +151,8 @@ def ensure_group(session, chat) -> Group:
         session.add(g)
         session.add(SubscriptionLog(chat_id=chat.id, actor_tg_user_id=None, action="trial_start", amount_days=7))
         session.commit()
-        # گزارش نصب به مالک
         try_send_owner(f"➕ ربات به گروه جدید اضافه شد:\n• {g.title}\n• chat_id: {g.id}\n• پلن: ۷ روز رایگان فعال شد.")
     return g
-
-def try_send_owner(text: str):
-    # به پیام خطا اهمیتی نمی‌دهیم (اگر مالک هنوز /start نزده باشد)
-    from telegram import Bot
-    if not TOKEN or not OWNER_ID: return
-    try:
-        Bot(TOKEN).send_message(OWNER_ID, text)
-    except Exception as e:
-        logging.info(f"Owner DM failed: {e}")
 
 def group_active(g: Group) -> bool:
     return bool(g.expires_at and g.expires_at > dt.datetime.utcnow())
@@ -180,13 +199,12 @@ def chunked(lst: List, n: int):
         yield lst[i:i+n]
 
 def mention_of(u: User) -> str:
-    # اگر username داشت از @username استفاده می‌کنیم، وگرنه HTML mention با tg://user?id
     if u.username:
         return f"@{u.username}"
     name = u.first_name or "کاربر"
     return f'<a href="tg://user?id={u.tg_user_id}">{name}</a>'
 
-# -------------------- Patterns --------------------
+# -------------------- PATTERNS --------------------
 PAT_GROUP = {
     "help": re.compile(r"^(?:فضول کمک|راهنما|کمک)$"),
     "gender": re.compile(r"^ثبت جنسیت (دختر|پسر)$"),
@@ -216,13 +234,12 @@ PAT_DM = {
     "help": re.compile(r"^کمک$"),
 }
 
-# -------------------- Group Handlers --------------------
+# -------------------- GROUP HANDLER --------------------
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text:
         return
     text = clean_text(update.message.text)
 
-    # HELP
     if PAT_GROUP["help"].match(text):
         return await update.message.reply_text(
             "🕵️‍♂️ دستورات گروه (بدون /):\n"
@@ -235,7 +252,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ فقط به همین دستورات پاسخ می‌دم."
         )
 
-    # آغاز سشن و گروه
     with SessionLocal() as s:
         g = ensure_group(s, update.effective_chat)
 
@@ -354,7 +370,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]])
             return await update.message.reply_text("⌁ پنل شارژ گروه:", reply_markup=kb)
 
-        # تگ‌ها (فقط با ریپلای، 4تایی-4تایی، ریپلای روی همان پیام)
+        # تگ‌ها (با ریپلای، ۴تایی-۴تایی، ریپلای روی همان پیام)
         if PAT_GROUP["tag_girls"].match(text) or PAT_GROUP["tag_boys"].match(text) or PAT_GROUP["tag_all"].match(text):
             if not update.message.reply_to_message:
                 return await update.message.reply_text("برای تگ کردن، باید روی یک پیام ریپلای کنی.")
@@ -367,11 +383,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 users = s.query(User).filter_by(chat_id=g.id).all()
                 header = "تگ همه:"
-            # فقط کسانی که حداقل یک بار دیده شده‌اند ثبت هستند؛ همین‌ها را تگ می‌کنیم.
             if not users: return await update.message.reply_text("کسی برای تگ پیدا نشد.")
             reply_to = update.message.reply_to_message.message_id
             await update.message.reply_text(header, reply_to_message_id=reply_to)
-            # 4تایی-4تایی
             mentions = [mention_of(u) for u in users]
             for pack in chunked(mentions, 4):
                 try:
@@ -386,7 +400,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.info(f"Tag batch send failed: {e}")
             return
 
-    # شمارش ریپلای‌ها (بی‌صدا برای آمار)
+    # شمارش ریپلای‌ها برای آمار (بی‌صدا)
     if update.message.reply_to_message:
         with SessionLocal() as s:
             g = ensure_group(s, update.effective_chat)
@@ -402,7 +416,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.reply_count += 1
             s.commit()
 
-# -------------------- Owner/Seller DM Panel --------------------
+# -------------------- OWNER/SELLER DM PANEL --------------------
 async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not update.message or not update.message.text:
         return
@@ -412,7 +426,6 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid != OWNER_ID and not is_seller(s, uid):
             return await update.message.reply_text("سلام! برای استفاده مدیریتی باید مالک یا فروشنده باشی.")
 
-        # پنل
         if PAT_DM["panel"].match(text) or PAT_DM["help"].match(text):
             return await update.message.reply_text(
                 "🛠 پنل مدیریت:\n"
@@ -429,7 +442,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not groups: return await update.message.reply_text("گروهی ثبت نشده.")
             lines = []
             now = dt.datetime.utcnow()
-            for g in groups[:50]:
+            for g in groups[:100]:
                 status = "فعال ✅" if g.expires_at and g.expires_at > now else "منقضی ⛔️"
                 lines.append(f"{g.title}  | chat_id: {g.id} | تا: {g.expires_at} UTC | {status} | TZ: {g.timezone or '-'}")
             return await update.message.reply_text("\n".join(lines))
@@ -454,7 +467,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             g.timezone = tzname; s.commit()
             return await update.message.reply_text(f"⏱ تایم‌زون گروه تنظیم شد: {tzname}")
 
-        if m := PAT_DM["list_sellers"].match(text):
+        if PAT_DM["list_sellers"].match(text):
             sellers = s.query(Seller).order_by(Seller.id.asc()).all()
             if not sellers: return await update.message.reply_text("هیچ فروشنده‌ای ثبت نشده.")
             lines = [f"{x.id}) {x.tg_user_id} | {'فعال' if x.is_active else 'غیرفعال'} | {x.note or ''}" for x in sellers]
@@ -482,7 +495,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ex.is_active = False; s.commit()
             return await update.message.reply_text("🗑️ فروشنده غیرفعال شد.")
 
-# -------------------- Callback (charge buttons) --------------------
+# -------------------- CALLBACKS (Charge buttons) --------------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data: return
@@ -499,9 +512,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s.commit()
         await q.edit_message_text(f"✅ تمدید شد تا {g.expires_at} UTC")
 
-# -------------------- ChatMember events (install/uninstall reports) --------------------
+# -------------------- INSTALL/UNINSTALL REPORTS --------------------
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # وقتی ربات به گروه اضافه/حذف می‌شود
     if not update.my_chat_member: return
     chat = update.my_chat_member.chat
     new_status = update.my_chat_member.new_chat_member.status
@@ -514,7 +526,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif new_status in ("left","kicked") and old_status in ("member","administrator"):
                 try_send_owner(f"➖ ربات از گروه حذف شد:\n• {chat.title}\n• chat_id: {chat.id}")
 
-# -------------------- Schedulers --------------------
+# -------------------- SCHEDULED JOBS --------------------
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
     """هر شب: محبوب‌های امروز + شیپ شبانه برای گروه‌های فعال"""
     with SessionLocal() as s:
