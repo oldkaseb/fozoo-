@@ -601,6 +601,98 @@ def kb_config(chat_id: int, bot_username: str) -> List[List[InlineKeyboardButton
         [InlineKeyboardButton("➕ افزودن ربات به گروه", url=f"https://t.me/{bot_username}?startgroup=true")],
         [InlineKeyboardButton("🧹 پاکسازی گروه", callback_data=f"wipe:{chat_id}")],
     ]
+# ================== TARGET HELPERS (waiters / selectors) ==================
+# نگه‌داشتن وضعیت «در انتظار هدف» برای هر کاربر در هر گروه
+WAITERS: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+def _wkey(chat_id: int, user_id: int) -> Tuple[int, int]:
+    return (chat_id, user_id)
+
+def _set_waiter(chat_id: int, user_id: int, purpose: str) -> None:
+    # purpose یکی از: relation_set | relation_del | crush_add | crush_del | admin_add | admin_del
+    WAITERS[_wkey(chat_id, user_id)] = {"for": purpose, "at": dt.datetime.utcnow()}
+
+def _peek_waiter(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    return WAITERS.get(_wkey(chat_id, user_id))
+
+def _pop_waiter(chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    return WAITERS.pop(_wkey(chat_id, user_id), None)
+
+def parse_target_token(s: str) -> Tuple[str, Any]:
+    """
+    ورودی کاربر برای اشاره به هدف را پارس می‌کند.
+    خروجی:
+      ("username", "foo")  وقتی مثل @foo یا foo است (فقط حروف/عدد/آندرلاین)
+      ("id", 123456789)    وقتی عددی است
+      ("bad", None)        در غیر این صورت
+    """
+    t = fa_to_en_digits(clean_text(s))
+    if not t:
+        return ("bad", None)
+    # اگر با @ شروع شد
+    if t.startswith("@"):
+        uname = t[1:].strip()
+        if re.fullmatch(r"\w{3,}", uname or ""):
+            return ("username", uname)
+        return ("bad", None)
+    # اگر فقط یک توکن مثل foo بود
+    if " " not in t and re.fullmatch(r"\w{3,}", t):
+        # به‌عنوان یوزرنیم قبول می‌کنیم
+        return ("username", t)
+    # اگر عددی بود (آیدی تلگرام)
+    digits = t.replace(" ", "")
+    if re.fullmatch(r"\d{5,}", digits):
+        try:
+            return ("id", int(digits))
+        except Exception:
+            return ("bad", None)
+    return ("bad", None)
+
+def find_user_by_selector(session, chat_id: int, sel_type: str, sel_val: Any) -> Optional['User']:
+    """
+    sel_type: "username" یا "id"
+    در دیتابیس همان گروه به‌دنبالش می‌گردد. کاربر باید قبلاً در گروه پیام داده باشد.
+    """
+    if sel_type == "username":
+        return session.execute(
+            select(User).where(User.chat_id == chat_id, User.username == str(sel_val))
+        ).scalar_one_or_none()
+    if sel_type == "id":
+        return session.execute(
+            select(User).where(User.chat_id == chat_id, User.tg_user_id == int(sel_val))
+        ).scalar_one_or_none()
+    return None
+
+def _target_from_reply(session, chat_id: int, update: Update) -> Optional['User']:
+    """اگر روی پیام کسی ریپلای شده بود، همان فرد را (در DB گروه) برمی‌گرداند/می‌سازد."""
+    if not update.message or not update.message.reply_to_message:
+        return None
+    try:
+        return upsert_user(session, chat_id, update.message.reply_to_message.from_user)
+    except Exception:
+        return None
+
+async def prompt_target(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str):
+    """وقتی هدف مشخص نیست از کاربر می‌خواهیم @یوزرنیم یا آیدی عددی بفرستد."""
+    txt = (
+        f"🔎 {title}\n"
+        "لطفاً @یوزرنیم یا آیدی عددی طرف مقابل را ارسال کن.\n"
+        "مثال: @foo یا 123456789"
+    )
+    await reply_temp(update, context, txt, keep=False)
+
+async def open_relation_wizard_by_uid(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_internal_id: int):
+    """
+    ویزارد تاریخ شروع رابطه را بر اساس user.id داخلی (جدول users) باز می‌کند.
+    از مسیر relid:* در کال‌بک‌ها استفاده می‌کنیم.
+    """
+    y = jalali_now_year()
+    years = list(range(y, y-16, -1))
+    rows: List[List[InlineKeyboardButton]] = []
+    for chunk in chunked(years, 4):
+        rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"relid:y:{target_user_internal_id}:{yy}") for yy in chunk])
+    rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"relid:yp:{target_user_internal_id}:{y-16}")])
+    await panel_open_initial(update, context, "سال شمسی شروع رابطه را انتخاب کن", rows, root=False)
 
 # ================== PATTERNS ==================
 PAT_GROUP = {
