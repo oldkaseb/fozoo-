@@ -26,6 +26,268 @@ from telegram.ext import (
 )
 from telegram.error import Conflict as TgConflict
 
+# ===== Safety shims: normalizers & "Fazol" word detection =====
+import re as _re
+
+if "ARABIC_FIX_MAP" not in globals():
+    ARABIC_FIX_MAP = str.maketrans({
+        "ي": "ی", "ى": "ی", "ئ": "ی", "ك": "ک",
+        "ـ": "",
+    })
+
+if "PUNCS" not in globals():
+    PUNCS = " \u200c\u200f\u200e\u2066\u2067\u2068\u2069\t\r\n.,!?؟،;:()[]{}«»\"'"
+
+if "fa_norm" not in globals():
+    def fa_norm(s: str) -> str:
+        if s is None:
+            return ""
+        s = str(s).translate(ARABIC_FIX_MAP)
+        s = s.replace("\u200c", " ").replace("\u200f", "").replace("\u200e", "")
+        s = s.replace("\u202a", "").replace("\u202c", "")
+        s = _re.sub(r"\s+", " ", s).strip()
+        return s
+
+if "clean_text" not in globals():
+    def clean_text(s: str) -> str:
+        return fa_norm(s)
+
+if "RE_WORD_FAZOL" not in globals():
+    RE_WORD_FAZOL = _re.compile(rf"(?:^|[{_re.escape(PUNCS)}])فضول(?:[{_re.escape(PUNCS)}]|$)")
+
+# ===== Safety shims: roles, patterns, minimal UI helpers =====
+import re as _re
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+
+# --- role helpers ---
+if "is_seller" not in globals():
+    def is_seller(session, tg_user_id: int) -> bool:
+        # شیم: فقط False برمی‌گرداند. نسخهٔ اصلی‌اش اگر بود، استفاده می‌شود.
+        return False
+
+if "is_group_admin" not in globals():
+    def is_group_admin(session, chat_id: int, tg_user_id: int) -> bool:
+        # شیم: مالک را ادمین می‌داند، بقیه False
+        try:
+            return tg_user_id == OWNER_ID
+        except Exception:
+            return False
+
+# --- tiny menu keyboard (if missing) ---
+if "kb_group_menu" not in globals():
+    def kb_group_menu(is_group_admin_flag: bool) -> list[list[InlineKeyboardButton]]:
+        rows = [
+            [InlineKeyboardButton("👤 ثبت جنسیت", callback_data="ui:gset")],
+            [InlineKeyboardButton("🎂 ثبت تولد", callback_data="ui:bd:start")],
+            [InlineKeyboardButton("💘 ثبت کراش (ریپلای)", callback_data="ui:crush:add"),
+             InlineKeyboardButton("🗑️ حذف کراش", callback_data="ui:crush:del")],
+            [InlineKeyboardButton("💞 ثبت رابطه (راهنما)", callback_data="ui:rel:help")],
+            [InlineKeyboardButton("👑 محبوب امروز", callback_data="ui:pop"),
+             InlineKeyboardButton("💫 شیپ امشب", callback_data="ui:ship")],
+            [InlineKeyboardButton("❤️ شیپم کن", callback_data="ui:shipme")],
+            [InlineKeyboardButton("🏷️ تگ دخترها", callback_data="ui:tag:girls"),
+             InlineKeyboardButton("🏷️ تگ پسرها", callback_data="ui:tag:boys")],
+            [InlineKeyboardButton("🏷️ تگ همه", callback_data="ui:tag:all")],
+            [InlineKeyboardButton("🔐 داده‌های من", callback_data="ui:privacy:me"),
+             InlineKeyboardButton("🗑️ حذف من", callback_data="ui:privacy:delme")],
+        ]
+        if is_group_admin_flag:
+            rows.append([InlineKeyboardButton("⚙️ پیکربندی فضول", callback_data="cfg:open")])
+        return rows
+
+# --- minimal panel helpers (fallback) ---
+if "panel_open_initial" not in globals():
+    async def panel_open_initial(update, context, title: str, rows: list[list[InlineKeyboardButton]], root: bool = True):
+        # شیم ساده: فقط پیام را با کیبورد می‌فرستد (بدون state ناوبری)
+        try:
+            await update.effective_chat.send_message(
+                title, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            )
+        except Exception:
+            # fallback بدون کیبورد
+            await update.effective_chat.send_message(title, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+if "panel_edit" not in globals():
+    async def panel_edit(context, qmsg, opener_id: int, title: str, rows: list[list[InlineKeyboardButton]],
+                         root: bool = False, parse_mode: str | None = None):
+        # شیم ساده: اگر امکان ویرایش نبود، پیام تازه می‌فرستد
+        try:
+            await qmsg.edit_text(title, reply_markup=InlineKeyboardMarkup(rows),
+                                 parse_mode=parse_mode or ParseMode.HTML, disable_web_page_preview=True)
+        except Exception:
+            try:
+                await qmsg.chat.send_message(title, reply_markup=InlineKeyboardMarkup(rows),
+                                             parse_mode=parse_mode or ParseMode.HTML, disable_web_page_preview=True)
+            except Exception:
+                await qmsg.chat.send_message(title, parse_mode=parse_mode or ParseMode.HTML, disable_web_page_preview=True)
+
+# --- group & dm patterns (fallbacks) ---
+if "PAT_GROUP" not in globals():
+    PAT_GROUP = {
+        # منو/کمک (وجود کلمه «فضول» با RE_WORD_FAZOL چک می‌شود)
+        "menu": _re.compile(r"^(?:فضول منو|منو)$"),
+        "help": _re.compile(r"^(?:فضول کمک|راهنما|کمک)$"),
+
+        # جنسیت/تولد
+        "gender": _re.compile(r"^ثبت جنسیت (دختر|پسر)$"),
+        "birthday_wizard": _re.compile(r"^ثبت تولد$"),
+        "birthday_set": _re.compile(r"^ثبت تولد ([\d\/\-]+)$"),
+        "birthday_del": _re.compile(r"^حذف تولد$"),
+
+        # رابطه (انعطاف)
+        "relation_any": _re.compile(r"^ثبت رابطه(?:\s+(?:@?(\w+)|(\d+)))?$"),
+        "relation_del_any": _re.compile(r"^حذف رابطه(?:\s+(?:@?(\w+)|(\d+)))?$"),
+
+        # کراش (انعطاف)
+        "crush_add_any": _re.compile(r"^ثبت کراش(?:\s+(?:@?(\w+)|(\d+)))?$"),
+        "crush_del_any": _re.compile(r"^حذف کراش(?:\s+(?:@?(\w+)|(\d+)))?$"),
+
+        # محبوب/شیپ/تگ/حریم
+        "popular_today": _re.compile(r"^محبوب امروز$"),
+        "ship_tonight": _re.compile(r"^شیپ امشب$"),
+        "ship_me": _re.compile(r"^شیپم کن$"),
+        "expiry": _re.compile(r"^فضول انقضا$"),
+        "charge": _re.compile(r"^فضول شارژ$"),
+        "tag_girls": _re.compile(r"^تگ دخترها$"),
+        "tag_boys": _re.compile(r"^تگ پسرها$"),
+        "tag_all": _re.compile(r"^تگ همه$"),
+        "privacy_me": _re.compile(r"^حذف من$"),
+        "privacy_info": _re.compile(r"^(?:داده(?:‌| )های من|حریم خصوصی)$"),
+        "wipe_group": _re.compile(r"^پاکسازی گروه$"),
+    }
+
+if "PAT_DM" not in globals():
+    PAT_DM = {
+        "panel": _re.compile(r"^(?:پنل|مدیریت|کمک)$"),
+        "groups": _re.compile(r"^گروه‌ها$"),
+        "manage": _re.compile(r"^مدیریت (\-?\d+)$"),
+        "extend": _re.compile(r"^تمدید (\-?\d+)\s+(\d+)$"),
+        "add_seller": _re.compile(r"^افزودن فروشنده (\d+)(?:\s+(.+))?$"),
+        "del_seller": _re.compile(r"^حذف فروشنده (\d+)$"),
+        "list_sellers": _re.compile(r"^لیست فروشنده‌ها$"),
+        "bot_stats": _re.compile(r"^(?:آمار فضول|فضول آمار|آمار ربات)$"),
+    }
+
+# ===== Safety shims: callbacks, private handler, misc helpers =====
+from typing import List as _List
+import re as _re
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+
+# --- kb_config (fallback) ---
+if "kb_config" not in globals():
+    def kb_config(chat_id: int, bot_username: str) -> _List[_List[InlineKeyboardButton]]:
+        return [
+            [InlineKeyboardButton("⚡️ شارژ گروه", callback_data="ui:charge:open")],
+            [InlineKeyboardButton("👥 مدیران گروه", callback_data="ga:list")],
+            [InlineKeyboardButton("ℹ️ مشاهده انقضا", callback_data="ui:expiry")],
+            [InlineKeyboardButton("⛔️ صفر کردن شارژ", callback_data=f"chg:{chat_id}:0")],
+            [InlineKeyboardButton("🚪 خروج ربات", callback_data=f"grp:{chat_id}:leave")],
+            [InlineKeyboardButton("➕ افزودن ربات به گروه", url=f"https://t.me/{bot_username}?startgroup=true")],
+            [InlineKeyboardButton("🧹 پاکسازی گروه", callback_data=f"wipe:{chat_id}")],
+        ]
+
+# --- sync_group_admins (fallback) ---
+if "sync_group_admins" not in globals():
+    async def sync_group_admins(bot, chat_id: int) -> int:
+        try:
+            admins = await bot.get_chat_administrators(chat_id)
+            tg_ids = [a.user.id for a in admins if not a.user.is_bot]
+            if not tg_ids:
+                return 0
+            added = 0
+            with SessionLocal() as s:
+                for uid in tg_ids:
+                    exists = s.execute(
+                        select(GroupAdmin).where(GroupAdmin.chat_id == chat_id, GroupAdmin.tg_user_id == uid)
+                    ).scalar_one_or_none()
+                    if not exists:
+                        s.add(GroupAdmin(chat_id=chat_id, tg_user_id=uid)); added += 1
+                s.commit()
+            return added
+        except Exception:
+            return 0
+
+# --- user_help_text (fallback) ---
+if "user_help_text" not in globals():
+    def user_help_text() -> str:
+        return (
+            "📘 راهنمای سریع:\n"
+            "• «فضول» → تست سلامت (جانم)\n"
+            "• «فضول منو» → منوی دکمه‌ای\n"
+            "• «ثبت جنسیت دختر/پسر» (ادمین: با ریپلای برای دیگران)\n"
+            "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» (ادمین: با ریپلای برای دیگران)\n"
+            "• «ثبت کراش/حذف کراش» (ریپلای)\n"
+            "• «ثبت رابطه @username» (ویزارد) / «حذف رابطه @username»\n"
+            "• «محبوب امروز» / «شیپ امشب» / «شیپم کن»\n"
+            "• «تگ دخترها|پسرها|همه» (ریپلای)\n"
+            "• «حریم خصوصی» / «حذف من»\n"
+        )
+
+# --- open_relation_wizard_by_uid (fallback minimal) ---
+if "open_relation_wizard_by_uid" not in globals():
+    async def open_relation_wizard_by_uid(update: Update, context, target_user_id: int):
+        # شیم ساده: فقط راهنمای متن می‌دهد تا خطا ندهد.
+        txt = (
+            "برای ثبت رابطه، تاریخ شمسی را به‌صورت «YYYY/MM/DD» بنویس.\n"
+            "نمونه: «ثبت رابطه @username ۱۴۰۲/۱۲/۰۱»"
+        )
+        await reply_temp(update, context, txt, keep=False)
+
+# --- on_callback (fallback) ---
+if "on_callback" not in globals():
+    async def on_callback(update: Update, context):
+        q = update.callback_query
+        if not q:
+            return
+        try:
+            await q.answer()
+        except Exception:
+            ...
+        data = q.data or ""
+        # چند پاسخ ساده برای دکمه‌های راهنما
+        if data in ("usr:help", "ui:rel:help"):
+            await panel_edit(context, q.message, q.from_user.id, user_help_text(),
+                             [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
+            return
+        if data == "nav:close":
+            try:
+                await q.message.delete()
+            except Exception:
+                ...
+            return
+        # پیش‌فرض
+        try:
+            await panel_edit(context, q.message, q.from_user.id, "اوکی ✅",
+                             [[InlineKeyboardButton("بستن", callback_data="nav:close")]], root=False)
+        except Exception:
+            ...
+
+# --- on_private_text (fallback) ---
+if "on_private_text" not in globals():
+    async def on_private_text(update: Update, context):
+        if update.effective_chat.type != "private" or not update.message or not update.message.text:
+            return
+        text = clean_text(update.message.text)
+        if text in ("/start", "start", "کمک", "راهنما"):
+            await reply_temp(update, context, user_help_text(), keep=True)
+            return
+        await reply_temp(update, context, "این ربات برای گروه‌هاست. برای راهنما «کمک» را بفرست.", keep=True)
+
+# --- on_my_chat_member (fallback) ---
+if "on_my_chat_member" not in globals():
+    async def on_my_chat_member(update: Update, context):
+        try:
+            chat = update.my_chat_member.chat if update.my_chat_member else None
+            if not chat:
+                return
+            with SessionLocal() as s:
+                _ = ensure_group(s, chat)
+                s.commit()
+        except Exception as e:
+            logging.info(f"on_my_chat_member (shim) err: {e}")
+
 # ================== CONFIG ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
