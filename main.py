@@ -69,12 +69,10 @@ def fmt_date_fa(d: Optional[dt.date]) -> str:
     return d.strftime("%Y/%m/%d")
 
 def today_jalali(tz: ZoneInfo) -> Tuple[int,int,int]:
-    """returns (jy, jm, jd) today in Jalali for a tz"""
     now = dt.datetime.now(tz)
     if HAS_PTOOLS:
         j = JalaliDateTime.fromgregorian(datetime=now)
         return j.year, j.month, j.day
-    # fallback to gregorian values
     d = now.date()
     return d.year, d.month, d.day
 
@@ -105,7 +103,7 @@ async def _job_delete_message(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 def schedule_autodelete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, keep: bool=False):
-    if keep:  # don't schedule deletion
+    if keep:
         return
     jq = context.application.job_queue if hasattr(context, "application") else None
     if jq:
@@ -289,7 +287,7 @@ def try_send_owner(text_msg: str):
     except Exception as e:
         logging.info(f"Owner DM failed: {e}")
 
-def ensure_group(session, chat) -> Group:
+def ensure_group(session, chat) -> 'Group':
     g = session.get(Group, chat.id)
     if not g:
         g = Group(
@@ -367,8 +365,7 @@ TAG_DELAY_SECONDS = 0.8
 
 # ====== PATTERNS ======
 PAT_GROUP = {
-    "help": re.compile(r"^(?:فضول کمک|راهنما|کمک)$"),
-    "menu": re.compile(r"^(?:منو|فضول منو)$"),
+    "help": re.compile(r"^(?:فضول کمک|راهنما|کمک|فضول منو|منو)$"),
     "config": re.compile(r"^(?:پیکربندی فضول|فضول پیکربندی|فضول تنظیمات|تنظیمات فضول)$"),
     "admin_add": re.compile(r"^فضول ادمین(?: @?(\w+))?$"),
     "admin_del": re.compile(r"^حذف فضول ادمین(?: @?(\w+))?$"),
@@ -507,7 +504,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         g = ensure_group(s, update.effective_chat)
         is_gadmin = is_group_admin(s, g.id, update.effective_user.id)
 
-    if PAT_GROUP["help"].match(text) or PAT_GROUP["menu"].match(text):
+    if PAT_GROUP["help"].match(text):
         await reply_temp(update, context, "🕹 منوی فضول:", reply_markup=build_group_menu(is_gadmin))
         return
 
@@ -893,10 +890,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # برای همهٔ پنل‌ها: بعد از هر کلیک، تایمر حذف روی همان پیام
-    autodel_qmessage(context, q.message)
+    autodel_qmessage(context, q.message)  # تایمر حذف برای پیام پنل
 
-    # کاربر معمولی: راهنما
     if q.data == "usr:help":
         txt = (
             "راهنمای سریع کاربر:\n"
@@ -905,10 +900,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ۷ روز تست رایگان پس از افزودن ربات به گروه."
         )
         await q.message.reply_text(footer(txt), reply_markup=contact_kb(bot_username=context.bot.username))
-        autodel_qmessage(context, q.message)  # خود پیام پنل هم حذف می‌شود
         return
 
-    # پیکربندی
     if q.data == "cfg:open":
         with SessionLocal() as s:
             if not is_group_admin(s, q.message.chat.id, q.from_user.id):
@@ -1075,7 +1068,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ex.is_active = False; s.commit()
                 await q.answer("🗑️ فروشنده عزل شد.", show_alert=True); return
             elif sub == "add" and arg=="help":
-                txt = "برای افزودن فروشنده: در همین چت بفرست:\n«افزودن فروشنده <tg_user_id> [یادداشت]»"
+                txt = "برای افزودن فروشنده: در همین چت بفرست:\n«افزودن فروشنده <tg_user_id> [yادداشت]»"
                 await q.message.reply_text(footer(txt)); return
 
     # گروه: مدیران
@@ -1114,7 +1107,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("ثبت شد ✅", show_alert=False)
         return
 
-    # تقویم تولد (شمسی نمایش داده می‌شود، ذخیره‌سازی همچنان تاریخ میلادی)
+    # تقویم تولد (انتخاب سال/ماه/روز)
     def _year_page(start_year: int) -> InlineKeyboardMarkup:
         years = [start_year+i for i in range(-8, 9)]
         rows = []
@@ -1483,10 +1476,18 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     except: pass
 
 # ====== BOOT ======
+async def _post_init(app: Application):
+    # حذف وب‌هوک قبلی تا polling همه کالبک‌ها را بگیرد
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    logging.info(f"PersianTools enabled: {HAS_PTOOLS}")
+
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN env var is required.")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
@@ -1502,7 +1503,11 @@ def main():
         jq.run_daily(job_midnight, time=dt.time(21,0,0)) # 21 UTC ~ حوالی آخر شب ایران
 
     logging.info("FazolBot running…")
-    app.run_polling()
+    # همه آپدیت‌ها + پاک‌کردن صف آپدیت‌های قدیمی
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
