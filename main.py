@@ -691,7 +691,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # «فضول منو» یا «فضول کمک» وقتی کلمه‌ی «فضول» در متن هست
     if RE_WORD_FAZOL.search(text):
-        if "منو" in text or "فهرست" در text:
+        if "منو" in text or "فهرست" in text:
             with SessionLocal() as s:
                 g = ensure_group(s, update.effective_chat)
                 is_gadmin = is_group_admin(s, g.id, update.effective_user.id)
