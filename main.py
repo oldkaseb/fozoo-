@@ -50,6 +50,7 @@ DEFAULT_TZ = "Asia/Tehran"
 TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
 
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
+INSTANCE_TAG = os.getenv("INSTANCE_TAG", "").strip()
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "40"))
 DISABLE_SINGLETON = os.getenv("DISABLE_SINGLETON", "0").strip().lower() in ("1", "true", "yes")
 
@@ -479,7 +480,8 @@ SINGLETON_KEY = None
 def _advisory_key() -> int:
     if not TOKEN:
         return 0
-    return int(hashlib.blake2b(TOKEN.encode(), digest_size=8).hexdigest(), 16) % (2**31)
+    seed = TOKEN + ("|" + INSTANCE_TAG if INSTANCE_TAG else "")
+    return int(hashlib.blake2b(seed.encode(), digest_size=8).hexdigest(), 16) % (2**31)
 
 def _acquire_lock(conn, key: int) -> bool:
     cur = conn.cursor()
@@ -500,7 +502,7 @@ def acquire_singleton_or_exit():
     try:
         SINGLETON_CONN = engine.raw_connection()
         cur = SINGLETON_CONN.cursor()
-        cur.execute("SET application_name = 'fazolbot'")
+        cur.execute("SET application_name = %s", (f"fazolbot:{INSTANCE_TAG or 'bot'}",))
 
         try:
             cur.execute("SELECT pid, application_name, backend_start FROM pg_stat_activity WHERE application_name = 'fazolbot'")
@@ -546,7 +548,7 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
                 ...
             SINGLETON_CONN = engine.raw_connection()
             cur = SINGLETON_CONN.cursor()
-            cur.execute("SET application_name = 'fazolbot'")
+            cur.execute("SET application_name = %s", (f"fazolbot:{INSTANCE_TAG or 'bot'}",))
             cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
             ok = cur.fetchone()[0]
             if not ok:
