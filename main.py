@@ -303,6 +303,7 @@ OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "40"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
+DISABLE_SINGLETON = os.getenv("DISABLE_SINGLETON", "0").strip().lower() in ("1", "true", "yes")
 
 Base = declarative_base()
 
@@ -522,11 +523,12 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # ================== SINGLETON POLLING GUARD (PG ADVISORY LOCK) ==================
+# --- Singleton guard ---
 SINGLETON_CONN = None
 SINGLETON_KEY = None
 
 def _advisory_key() -> int:
-    """کلید پایدار براساس توکن ربات (برای جلوگیری از اجرای همزمان چند نمونه)."""
+    # کلید پایدار براساس توکن ربات
     if not TOKEN:
         return 0
     return int(hashlib.blake2b(TOKEN.encode(), digest_size=8).hexdigest(), 16) % (2**31)
@@ -540,16 +542,32 @@ def _acquire_lock(conn, key: int) -> bool:
 def acquire_singleton_or_exit():
     """اجازه نمی‌دهیم دو نمونه همزمان polling کنند (قفل مشورتی PG)."""
     global SINGLETON_CONN, SINGLETON_KEY
+
+    if DISABLE_SINGLETON:
+        logging.warning("⚠️ DISABLE_SINGLETON=1 → قفل تک‌نمونه‌ای غیرفعال شد. مسئولیت با خودت!")
+        return
+
     SINGLETON_KEY = _advisory_key()
+    logging.info(f"Singleton key = {SINGLETON_KEY}")
+
     try:
         SINGLETON_CONN = engine.raw_connection()
         cur = SINGLETON_CONN.cursor()
+        # کمک به دیباگ در pg_stat_activity
         cur.execute("SET application_name = 'fazolbot'")
+        try:
+            cur.execute("SELECT pid, application_name, backend_start FROM pg_stat_activity WHERE application_name = 'fazolbot'")
+            others = cur.fetchall()
+            if others:
+                logging.info(f"Active backends tagged 'fazolbot': {others}")
+        except Exception as e:
+            logging.debug(f"pg_stat_activity not accessible: {e}")
+
         ok = _acquire_lock(SINGLETON_CONN, SINGLETON_KEY)
         if not ok:
-            logging.error("نمونه‌ی دیگری در حال اجراست (PG advisory lock). خروج.")
+            logging.error("Another instance is already running (PG advisory lock). Exiting.")
             os._exit(0)
-        logging.info("Singleton lock گرفته شد؛ این نمونه تنها polling instance است.")
+        logging.info("Singleton advisory lock acquired. This is the only polling instance.")
     except Exception as e:
         logging.error(f"Singleton lock failed: {e}")
         os._exit(0)
@@ -564,7 +582,9 @@ def acquire_singleton_or_exit():
             ...
 
 async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
-    """سلامت اتصال قفل را پایش می‌کند و در صورت قطع، دوباره سعی به گرفتن قفل می‌کند."""
+    """اگر قفل فعال است، سلامت اتصال را پایش می‌کند."""
+    if DISABLE_SINGLETON:
+        return
     global SINGLETON_CONN, SINGLETON_KEY
     try:
         cur = SINGLETON_CONN.cursor()
@@ -580,14 +600,15 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
                 ...
             SINGLETON_CONN = engine.raw_connection()
             cur = SINGLETON_CONN.cursor()
+            cur.execute("SET application_name = 'fazolbot'")
             cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
             ok = cur.fetchone()[0]
             if not ok:
-                logging.error("از دست رفتن قفل و تصاحب توسط نمونه‌ی دیگر. خروج.")
+                logging.error("Lost advisory lock and another instance holds it now. Exiting.")
                 os._exit(0)
-            logging.info("قفل پس از ری‌استارت DB دوباره گرفته شد.")
+            logging.info("Advisory lock re-acquired after DB restart.")
         except Exception as e2:
-            logging.error(f"Re-acquire advisory lock failed: {e2}")
+            logging.error(f"Failed to re-acquire advisory lock: {e2}")
 
 # ================== ORM MODELS ==================
 from sqlalchemy.orm import Mapped, mapped_column
