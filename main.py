@@ -449,7 +449,7 @@ def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[Lis
         [InlineKeyboardButton("🎂 ثبت تولد", callback_data="ui:bd:start")],
         [InlineKeyboardButton("💘 ثبت کراش (ریپلای)", callback_data="ui:crush:add"),
          InlineKeyboardButton("🗑️ حذف کراش", callback_data="ui:crush:del")],
-        [InlineKeyboardButton("💞 ثبت رابطه (راهنما)", callback_data="ui:rel:help")],
+        [InlineKeyboardButton("💞 ثبت رل (راهنما)", callback_data="ui:rel:help")],
         [InlineKeyboardButton("👑 محبوب امروز", callback_data="ui:pop"),
          InlineKeyboardButton("💫 شیپ امشب", callback_data="ui:ship")],
         [InlineKeyboardButton("❤️ شیپم کن", callback_data="ui:shipme")],
@@ -459,7 +459,7 @@ def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[Lis
         [InlineKeyboardButton("🔐 داده‌های من", callback_data="ui:privacy:me"),
          InlineKeyboardButton("🗑️ حذف من", callback_data="ui:privacy:delme")],
     ]
-    if is_group_admin_flag or is_operator_flag:
+    if is_operator_flag:
         rows.append([InlineKeyboardButton("⚙️ پیکربندی فضول", callback_data="cfg:open")])
     return rows
 
@@ -470,6 +470,7 @@ def add_nav(rows: List[List[InlineKeyboardButton]], root: bool = False) -> Inlin
 
 PANELS: Dict[Tuple[int,int], Dict[str, Any]] = {}
 REL_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
+BD_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
 SELLER_WAIT: Dict[int, Dict[str, Any]] = {}
 REL_USER_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
 
@@ -595,10 +596,10 @@ def user_help_text() -> str:
         "• «فضول» → تست سلامت\n"
         "• «فضول منو» → منوی دکمه‌ای\n"
         "• «ثبت جنسیت دختر/پسر» (ادمین: با ریپلای برای دیگران)\n"
-        "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» (ادمین: با ریپلای برای دیگران)\n"
-        "• «ثبت رابطه» → انتخاب از لیست/جستجو → سال/ماه/روز\n"
+        "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» یا «ثبت تولد» (کیبورد) یا «ثبت تولد» (کیبورد)\n"
+        "• «ثبت رل» → انتخاب طرف + تاریخ (یا «شروع رابطه ۱۴۰۳/۰۵/۲۰»)\n"
         "• «کراشام» → لیست کراش‌ها\n"
-        "• «ایدی» → پروفایل کامل + محبوبیت\n"
+        "• «آیدی داده های من» → پروفایل کامل + محبوبیت\n"
         "• «محبوب امروز»، «شیپم کن»، «شیپ امشب»\n"
     )
 
@@ -805,6 +806,58 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ctx=_pop_rel_wait(chat_id, user_id)
         if not ctx:
             await panel_edit(context, msg, user_id, "جلسه پیدا نشد. دوباره «ثبت رابطه» را بزن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+
+    # --- Birthday date wizard (callbacks) ---
+    if data=="ui:bd:start":
+        y = jalali_now_year()
+        years = list(range(y, y-90, -1))
+        rows=[]
+        for ch in chunked(years,4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in ch])
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"bd:yp:{y-90}")])
+        # set context for self
+        with SessionLocal() as s:
+            g=ensure_group(s, msg.chat); me = upsert_user(s, g.id, q.from_user)
+        BD_WAIT[(msg.chat.id, q.from_user.id)] = {"target_user_id": me.id, "ts": dt.datetime.utcnow().timestamp()}
+        await panel_edit(context, msg, user_id, "تاریخ تولد — سال را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^bd:yp:(\d+)$", data)
+    if m:
+        start=int(m.group(1)); years=list(range(start, start-90, -1))
+        rows=[[InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in years[i:i+4]] for i in range(0,len(years),4)]
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"bd:yp:{start-90}")])
+        await panel_edit(context, msg, user_id, "تاریخ تولد — سال را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^bd:y:(\d{4})$", data)
+    if m:
+        y=int(m.group(1))
+        months=list(range(1,13))
+        rows=[[InlineKeyboardButton(fa_digits(str(mm)), callback_data=f"bd:m:{y}-{mm}") for mm in months[i:i+4]] for i in range(0,12,4)]
+        await panel_edit(context, msg, user_id, f"سال {fa_digits(y)} — ماه را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^bd:m:(\d{4})-(\d{1,2})$", data)
+    if m:
+        y=int(m.group(1)); mth=int(m.group(2))
+        mdays=jalali_month_len(y, mth)
+        days=list(range(1, mdays+1))
+        rows=[[InlineKeyboardButton(fa_digits(str(dd)), callback_data=f"bd:d:{y}-{mth}-{dd}") for dd in days[i:i+7]] for i in range(0,len(days),7)]
+        await panel_edit(context, msg, user_id, f"{fa_digits(y)}/{fa_digits(mth)} — روز را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^bd:d:(\d{4})-(\d{1,2})-(\d{1,2})$", data)
+    if m:
+        y=int(m.group(1)); mth=int(m.group(2)); dd=int(m.group(3))
+        ctx = BD_WAIT.pop((chat_id, user_id), None)
+        if not ctx:
+            await panel_edit(context, msg, user_id, "جلسه پیدا نشد. دوباره «ثبت تولد» را بزن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+        try:
+            gdate = (JalaliDate(y,mth,dd).to_gregorian() if HAS_PTOOLS else dt.date(y,mth,dd))
+        except Exception:
+            await panel_edit(context, msg, user_id, "تاریخ نامعتبر بود.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+        with SessionLocal() as s:
+            u = s.get(User, ctx.get("target_user_id"))
+            if u:
+                u.birthday = gdate; s.commit()
+        await panel_edit(context, msg, user_id, f"✅ تولد ثبت شد: {fmt_date_fa(gdate)}", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
         target_user_id = ctx.get("target_user_id")
         with SessionLocal() as s:
             me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
@@ -980,14 +1033,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hints={
             "ui:crush:add":"برای «ثبت کراش»، روی پیام شخص ریپلای کن و بنویس «ثبت کراش». یا: «ثبت کراش @username / 123456»",
             "ui:crush:del":"برای «حذف کراش»، مانند بالا عمل کن.",
-            "ui:rel:help":"«ثبت رابطه» را بزن؛ از لیست انتخاب کن یا جستجو کن؛ سپس تاریخ را انتخاب کن.",
+            "ui:rel:help":"«ثبت رل» را بزن؛ از لیست انتخاب کن یا جستجو کن؛ سپس تاریخ را انتخاب کن.",
             "ui:tag:girls":"برای «تگ دخترها»، روی یک پیام ریپلای کن و بنویس: تگ دخترها",
             "ui:tag:boys":"برای «تگ پسرها»، روی یک پیام ریپلای کن و بنویس: تگ پسرها",
             "ui:tag:all":"برای «تگ همه»، روی یک پیام ریپلای کن و بنویس: تگ همه",
             "ui:pop":"برای «محبوب امروز»، همین دستور را در گروه بزن.",
             "ui:ship":"«شیپ امشب» آخر شب خودکار ارسال می‌شود.",
             "ui:shipme":"«شیپم کن» را در گروه بزن تا یک پارتنر پیشنهادی معرفی شود.",
-            "ui:privacy:me":"برای «داده‌های من»، همین دستور را در گروه بزن.",
+            "ui:privacy:me":"برای دیدن پروفایل: «آیدی داده های من» را در گروه بزن.",
             "ui:privacy:delme":"برای «حذف من»، همین دستور را در گروه بزن.",
         }
         await panel_edit(context, msg, user_id, hints.get(data,"اوکی"),
@@ -999,6 +1052,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
+
+    # shim: old command renamed
+    if re.match(r"^ثبت رابطه(?:\s+.*)?$", text):
+        await reply_temp(update, context, "این دستور به «ثبت رل» تغییر کرد. لطفاً از «ثبت رل» استفاده کن ✅"); return
     # Allow 'انتخاب از لیست' to open chooser
     if text.replace("‌","").strip() in ("انتخاب از لیست","انتخاب از ليست","از لیست","از ليست"):
         with SessionLocal() as s2:
@@ -1080,6 +1137,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "کمک" in text or "راهنما" in text:
             await reply_temp(update, context, user_help_text()); return
 
+        if "شارژ" not in text:
+            await reply_temp(update, context, "زهرمار"); return
+
     # owner quick panel for THIS group
     if text == "پنل اینجا":
         with SessionLocal() as s:
@@ -1132,7 +1192,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # relationship start (reply/@/id) -> or open chooser
-    m=re.match(r"^ثبت رابطه(?:\s+(.+))?$", text)
+    m=re.match(r"^ثبت رل(?:\s+(.+))?$", text)
     if m:
         selector=(m.group(1) or "").strip()
         with SessionLocal() as s2:
@@ -1182,6 +1242,160 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
     # birthday set# birthday set
+    # birthday wizard start with no date
+    if text == "ثبت تولد":
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            me=upsert_user(s, g.id, update.effective_user)
+            if update.message.reply_to_message and is_group_admin(s, g.id, update.effective_user.id):
+                target=upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            else:
+                target=me
+        BD_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"target_user_id": target.id, "ts": dt.datetime.utcnow().timestamp()}
+        y = jalali_now_year()
+        years = list(range(y, y-90, -1))
+        rows=[]
+        for ch in chunked(years,4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in ch])
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"bd:yp:{y-90}")])
+        await reply_temp(update, context, "تاریخ تولد — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+        return
+
+
+    # birthday wizard start with no date
+    if text == "ثبت تولد":
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            me=upsert_user(s, g.id, update.effective_user)
+            if update.message.reply_to_message and is_group_admin(s, g.id, update.effective_user.id):
+                target=upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            else:
+                target=me
+        BD_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"target_user_id": target.id, "ts": dt.datetime.utcnow().timestamp()}
+        y = jalali_now_year()
+        years = list(range(y, y-90, -1))
+        rows=[]
+        for ch in chunked(years,4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in ch])
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"bd:yp:{y-90}")])
+        await reply_temp(update, context, "تاریخ تولد — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+        return
+    # relationship start date via text: "شروع رابطه [امروز|yyyy/mm/dd]"
+    m = re.match(r"^شروع رابطه(?:\s+(امروز|[\d\/\-]+))?$", text)
+    if m:
+        date_str = m.group(1) or ""
+        # resolve target
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            me=upsert_user(s, g.id, update.effective_user)
+            target = None
+            if update.message.reply_to_message:
+                target = upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            else:
+                ctx = REL_WAIT.get((g.id, update.effective_user.id))
+                if ctx:
+                    target = s.get(User, ctx.get("target_user_id") or 0)
+                    if (not target) and ctx.get("target_tgid"):
+                        target = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==ctx.get("target_tgid"))).scalar_one_or_none()
+        if not target:
+            await reply_temp(update, context, "اول با «ثبت رل» طرف مقابل رو انتخاب کن یا روی پیامش ریپلای کن."); return
+        if not date_str:
+            _set_rel_wait(update.effective_chat.id, update.effective_user.id, target.id, target.tg_user_id)
+            y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+            for ch in chunked(years,4):
+                rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+            rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+            await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+            return
+        try:
+            if date_str == "امروز":
+                if HAS_PTOOLS:
+                    jnow = JalaliDateTime.fromgregorian(datetime=dt.datetime.now(TZ_TEHRAN))
+                    y,mn,d = jnow.year, jnow.month, jnow.day
+                else:
+                    now = dt.datetime.now(TZ_TEHRAN); y,mn,d = now.year, now.month, now.day
+            else:
+                ss = fa_to_en_digits(date_str).replace("/","-")
+                y,mn,d = (int(x) for x in ss.split("-"))
+            gdate = (JalaliDate(y,mn,d).to_gregorian() if HAS_PTOOLS else dt.date(y,mn,d))
+        except Exception:
+            await reply_temp(update, context, "فرمت تاریخ نامعتبر است. نمونه: «شروع رابطه ۱۴۰۳/۰۵/۲۰» یا «شروع رابطه امروز»."); return
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            me=upsert_user(s, g.id, update.effective_user)
+            other = target
+            # remove previous relationships for both
+            s.execute(Relationship.__table__.delete().where(
+                (Relationship.chat_id==g.id) &
+                ((Relationship.user_a_id==me.id)|(Relationship.user_b_id==me.id)|
+                 (Relationship.user_a_id==other.id)|(Relationship.user_b_id==other.id))
+            ))
+            ua, ub = (me.id, other.id) if me.id < other.id else (other.id, me.id)
+            s.add(Relationship(chat_id=g.id, user_a_id=ua, user_b_id=ub, started_at=gdate))
+            s.commit()
+        await reply_temp(update, context, f"✅ رابطه ثبت شد از {fmt_date_fa(gdate)}", keep=True)
+        return
+
+
+    # relationship start date via text: "شروع رابطه [امروز|yyyy/mm/dd]"
+    m = re.match(r"^شروع رابطه(?:\s+(امروز|[\d\/\-]+))?$", text)
+    if m:
+        date_str = m.group(1) or ""
+        # resolve target
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            me=upsert_user(s, g.id, update.effective_user)
+            target = None
+            if update.message.reply_to_message:
+                target = upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            else:
+                ctx = REL_WAIT.get((g.id, update.effective_user.id))
+                if ctx:
+                    target = s.get(User, ctx.get("target_user_id") or 0)
+                    if (not target) and ctx.get("target_tgid"):
+                        target = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==ctx.get("target_tgid"))).scalar_one_or_none()
+        if not target:
+            await reply_temp(update, context, "اول با «ثبت رل» طرف مقابل رو انتخاب کن یا روی پیامش ریپلای کن."); return
+        if not date_str:
+            _set_rel_wait(update.effective_chat.id, update.effective_user.id, target.id, target.tg_user_id)
+            y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+            for ch in chunked(years,4):
+                rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+            rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+            await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+            return
+        try:
+            if date_str == "امروز":
+                if HAS_PTOOLS:
+                    jnow = JalaliDateTime.fromgregorian(datetime=dt.datetime.now(TZ_TEHRAN))
+                    y,mn,d = jnow.year, jnow.month, jnow.day
+                else:
+                    now = dt.datetime.now(TZ_TEHRAN); y,mn,d = now.year, now.month, now.day
+            else:
+                ss = fa_to_en_digits(date_str).replace("/","-")
+                y,mn,d = (int(x) for x in ss.split("-"))
+            gdate = (JalaliDate(y,mn,d).to_gregorian() if HAS_PTOOLS else dt.date(y,mn,d))
+        except Exception:
+            await reply_temp(update, context, "فرمت تاریخ نامعتبر است. نمونه: «شروع رابطه ۱۴۰۳/۰۵/۲۰» یا «شروع رابطه امروز»."); return
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            me=upsert_user(s, g.id, update.effective_user)
+            other = target
+            # remove previous relationships for both
+            s.execute(Relationship.__table__.delete().where(
+                (Relationship.chat_id==g.id) &
+                ((Relationship.user_a_id==me.id)|(Relationship.user_b_id==me.id)|
+                 (Relationship.user_a_id==other.id)|(Relationship.user_b_id==other.id))
+            ))
+            ua, ub = (me.id, other.id) if me.id < other.id else (other.id, me.id)
+            s.add(Relationship(chat_id=g.id, user_a_id=ua, user_b_id=ub, started_at=gdate))
+            s.commit()
+        await reply_temp(update, context, f"✅ رابطه ثبت شد از {fmt_date_fa(gdate)}", keep=True)
+        return
+
+
+
+
     m=re.match(r"^ثبت تولد ([\d\/\-]+)$", text)
     if m:
         date_str=m.group(1)
@@ -1459,7 +1673,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username=context.bot.username
     if update.effective_chat.type!="private":
         txt=("سلام! من روشنم ✅\n"
-             "• «فضول» → جانم (تست سلامت)\n"
+             "• «فضول» → زهرمار (تست سلامت)\n"
              "• «فضول منو» → منوی دکمه‌ای\n"
              "• «فضول کمک» → راهنما")
         await reply_temp(update, context, txt); return
@@ -1496,7 +1710,7 @@ async def on_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m: return
     txt=clean_text((m.text or m.caption or "") or "")
     if txt=="فضول":
-        try: await m.reply_text("جانم 👂")
+        try: await m.reply_text("زهرمار 👂")
         except Exception: ...
 
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
@@ -2211,7 +2425,7 @@ def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[Lis
         [InlineKeyboardButton("🎂 ثبت تولد", callback_data="ui:bd:start")],
         [InlineKeyboardButton("💘 ثبت کراش (ریپلای)", callback_data="ui:crush:add"),
          InlineKeyboardButton("🗑️ حذف کراش", callback_data="ui:crush:del")],
-        [InlineKeyboardButton("💞 ثبت رابطه (راهنما)", callback_data="ui:rel:help")],
+        [InlineKeyboardButton("💞 ثبت رل (راهنما)", callback_data="ui:rel:help")],
         [InlineKeyboardButton("👑 محبوب امروز", callback_data="ui:pop"),
          InlineKeyboardButton("💫 شیپ امشب", callback_data="ui:ship")],
         [InlineKeyboardButton("❤️ شیپم کن", callback_data="ui:shipme")],
@@ -2221,7 +2435,7 @@ def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[Lis
         [InlineKeyboardButton("🔐 داده‌های من", callback_data="ui:privacy:me"),
          InlineKeyboardButton("🗑️ حذف من", callback_data="ui:privacy:delme")],
     ]
-    if is_group_admin_flag or is_operator_flag:
+    if is_operator_flag:
         rows.append([InlineKeyboardButton("⚙️ پیکربندی فضول", callback_data="cfg:open")])
     return rows
 
@@ -2232,6 +2446,7 @@ def add_nav(rows: List[List[InlineKeyboardButton]], root: bool = False) -> Inlin
 
 PANELS: Dict[Tuple[int,int], Dict[str, Any]] = {}
 REL_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
+BD_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
 SELLER_WAIT: Dict[int, Dict[str, Any]] = {}
 REL_USER_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
 
@@ -2357,8 +2572,8 @@ def user_help_text() -> str:
         "• «فضول» → تست سلامت\n"
         "• «فضول منو» → منوی دکمه‌ای\n"
         "• «ثبت جنسیت دختر/پسر» (ادمین: با ریپلای برای دیگران)\n"
-        "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» (ادمین: با ریپلای برای دیگران)\n"
-        "• «ثبت رابطه» → انتخاب از لیست/جستجو → سال/ماه/روز\n"
+        "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» یا «ثبت تولد» (کیبورد) یا «ثبت تولد» (کیبورد)\n"
+        "• «ثبت رل» → انتخاب طرف + تاریخ (یا «شروع رابطه ۱۴۰۳/۰۵/۲۰»)\n"
         "• «کراشام» → لیست کراش‌ها\n"
         "• «داده‌های من» → پروفایل کامل + محبوبیت\n"
         "• «محبوب امروز»، «شیپم کن»، «شیپ امشب»\n"
@@ -2742,14 +2957,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hints={
             "ui:crush:add":"برای «ثبت کراش»، روی پیام شخص ریپلای کن و بنویس «ثبت کراش». یا: «ثبت کراش @username / 123456»",
             "ui:crush:del":"برای «حذف کراش»، مانند بالا عمل کن.",
-            "ui:rel:help":"«ثبت رابطه» را بزن؛ از لیست انتخاب کن یا جستجو کن؛ سپس تاریخ را انتخاب کن.",
+            "ui:rel:help":"«ثبت رل» را بزن؛ از لیست انتخاب کن یا جستجو کن؛ سپس تاریخ را انتخاب کن.",
             "ui:tag:girls":"برای «تگ دخترها»، روی یک پیام ریپلای کن و بنویس: تگ دخترها",
             "ui:tag:boys":"برای «تگ پسرها»، روی یک پیام ریپلای کن و بنویس: تگ پسرها",
             "ui:tag:all":"برای «تگ همه»، روی یک پیام ریپلای کن و بنویس: تگ همه",
             "ui:pop":"برای «محبوب امروز»، همین دستور را در گروه بزن.",
             "ui:ship":"«شیپ امشب» آخر شب خودکار ارسال می‌شود.",
             "ui:shipme":"«شیپم کن» را در گروه بزن تا یک پارتنر پیشنهادی معرفی شود.",
-            "ui:privacy:me":"برای «داده‌های من»، همین دستور را در گروه بزن.",
+            "ui:privacy:me":"برای دیدن پروفایل: «آیدی داده های من» را در گروه بزن.",
             "ui:privacy:delme":"برای «حذف من»، همین دستور را در گروه بزن.",
         }
         await panel_edit(context, msg, user_id, hints.get(data,"اوکی"),
@@ -2842,6 +3057,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "کمک" in text or "راهنما" in text:
             await reply_temp(update, context, user_help_text()); return
 
+        if "شارژ" not in text:
+            await reply_temp(update, context, "زهرمار"); return
+
     # owner quick panel for THIS group
     if text == "پنل اینجا":
         with SessionLocal() as s:
@@ -2894,7 +3112,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # relationship start (reply/@/id) -> or open chooser
-    m=re.match(r"^ثبت رابطه(?:\s+(.+))?$", text)
+    m=re.match(r"^ثبت رل(?:\s+(.+))?$", text)
     if m:
         selector=(m.group(1) or "").strip()
         with SessionLocal() as s2:
@@ -3204,7 +3422,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username=context.bot.username
     if update.effective_chat.type!="private":
         txt=("سلام! من روشنم ✅\n"
-             "• «فضول» → جانم (تست سلامت)\n"
+             "• «فضول» → زهرمار (تست سلامت)\n"
              "• «فضول منو» → منوی دکمه‌ای\n"
              "• «فضول کمک» → راهنما")
         await reply_temp(update, context, txt); return
@@ -3241,7 +3459,7 @@ async def on_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m: return
     txt=clean_text((m.text or m.caption or "") or "")
     if txt=="فضول":
-        try: await m.reply_text("جانم 👂")
+        try: await m.reply_text("زهرمار 👂")
         except Exception: ...
 
 async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
