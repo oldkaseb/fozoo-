@@ -113,6 +113,9 @@ logging.getLogger("telegram").setLevel(logging.INFO)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 INSTANCE_TAG = os.getenv("INSTANCE_TAG", "").strip()
+# Auto-generate a stable short tag if empty (helps with logs in PaaS deployments)
+if not INSTANCE_TAG:
+    INSTANCE_TAG = hashlib.blake2b(f"{os.getenv('RAILWAY_SERVICE_NAME','')}-{os.getpid()}".encode(), digest_size=4).hexdigest()
 
 DEFAULT_TZ = "Asia/Tehran"
 TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
@@ -121,7 +124,10 @@ OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "40"))
 TTL_WAIT_SECONDS = int(os.getenv("TTL_WAIT_SECONDS", "1800"))  # 30 min
 TTL_PANEL_SECONDS = int(os.getenv("TTL_PANEL_SECONDS", "7200"))  # 2 hours
-DISABLE_SINGLETON = os.getenv("DISABLE_SINGLETON", "0").strip().lower() in ("1","true","yes")
+
+# Enforce singleton by default (safe for polling). To allow multi-instances, set ALLOW_MULTI=1.
+ALLOW_MULTI = os.getenv("ALLOW_MULTI", "").strip().lower() in ("1","true","yes")
+ENFORCE_SINGLETON = not ALLOW_MULTI
 
 Base = declarative_base()
 
@@ -578,8 +584,8 @@ def acquire_singleton_or_exit():
     logging.info("TOKEN hash (last8) = %s", thash)
     logging.info("INSTANCE_TAG = %r", INSTANCE_TAG)
     global SINGLETON_CONN, SINGLETON_KEY
-    if DISABLE_SINGLETON:
-        logging.warning("⚠️ DISABLE_SINGLETON=1 → singleton guard disabled."); return
+    if not ENFORCE_SINGLETON:
+        logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled."); return
     SINGLETON_KEY=_advisory_key(); logging.info(f"Singleton key = {SINGLETON_KEY}")
     try:
         SINGLETON_CONN = engine.raw_connection()
@@ -602,7 +608,7 @@ def acquire_singleton_or_exit():
         except Exception: ...
 
 async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
-    if DISABLE_SINGLETON: return
+    if not ENFORCE_SINGLETON: return
     global SINGLETON_CONN, SINGLETON_KEY
     # --- lightweight in-memory GC for stale waits/panels ---
     try:
