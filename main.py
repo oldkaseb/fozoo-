@@ -20,6 +20,7 @@ import asyncio
 import atexit
 import hashlib
 import datetime as dt
+import time
 import urllib.parse as _up
 from typing import Optional, List, Tuple, Dict, Any, Iterable, TypeVar
 
@@ -52,6 +53,8 @@ TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
 
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "40"))
+TTL_WAIT_SECONDS = int(os.getenv("TTL_WAIT_SECONDS", "1800"))  # 30 min
+TTL_PANEL_SECONDS = int(os.getenv("TTL_PANEL_SECONDS", "7200"))  # 2 hours
 DISABLE_SINGLETON = os.getenv("DISABLE_SINGLETON", "0").strip().lower() in ("1","true","yes")
 
 Base = declarative_base()
@@ -166,7 +169,7 @@ try:
     logging.info(f"DB host={parsed.hostname} port={parsed.port} path={parsed.path} driver={_DRIVER}")
 except Exception: ...
 
-engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=300, future=True, connect_args={"sslmode":"require"})
+engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=300, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 class Group(Base):
@@ -314,7 +317,7 @@ async def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
     if not keep:
         jq = context.application.job_queue
         if jq:
-            jq.run_once(lambda c: c.bot.delete_message(msg.chat_id, msg.message_id), when=AUTO_DELETE_SECONDS)
+            jq.run_once(lambda c: asyncio.create_task(c.bot.delete_message(msg.chat_id, msg.message_id)), when=AUTO_DELETE_SECONDS)
     return msg
 
 def ensure_group(session, chat) -> "Group":
@@ -378,6 +381,7 @@ def _panel_push(msg, owner_id: int, title: str, rows, root: bool):
     key=_panel_key(msg.chat.id, msg.message_id)
     meta=PANELS.get(key, {"owner": owner_id, "stack":[]})
     meta["owner"]=owner_id; meta["stack"].append((title, rows, root)); PANELS[key]=meta
+    meta["ts"] = time.time()
 def _panel_pop(msg):
     key=_panel_key(msg.chat.id, msg.message_id)
     meta=PANELS.get(key); 
@@ -388,7 +392,8 @@ def _panel_pop(msg):
 def _set_rel_wait(chat_id: int, actor_tg: int, target_user_id: int, target_tgid: int | None = None):
     ctx={"target_user_id": target_user_id};
     if target_tgid: ctx["target_tgid"]=target_tgid
-    REL_WAIT[(chat_id, actor_tg)]=ctx
+    ctx["ts"] = dt.datetime.utcnow().timestamp()
+    REL_WAIT[(chat_id, actor_tg)] = ctx
 def _pop_rel_wait(chat_id: int, actor_tg: int):
     return REL_WAIT.pop((chat_id, actor_tg), None)
 
@@ -443,6 +448,32 @@ def acquire_singleton_or_exit():
 async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
     if DISABLE_SINGLETON: return
     global SINGLETON_CONN, SINGLETON_KEY
+    # --- lightweight in-memory GC for stale waits/panels ---
+    try:
+        now = time.time()
+        # REL_USER_WAIT: has 'ts' and optional 'panel_key'
+        for k, v in list(REL_USER_WAIT.items()):
+            ts = v.get("ts")
+            if ts and (now - ts) > TTL_WAIT_SECONDS:
+                pk = v.get("panel_key")
+                try:
+                    if pk: asyncio.create_task(context.bot.delete_message(pk[0], pk[1]))
+                except Exception:
+                    ...
+                REL_USER_WAIT.pop(k, None)
+        # REL_WAIT: we stamped ts when setting
+        for k, v in list(REL_WAIT.items()):
+            ts = v.get("ts")
+            if ts and (now - ts) > TTL_WAIT_SECONDS:
+                REL_WAIT.pop(k, None)
+        # PANELS: clear very old stacks
+        for k, meta in list(PANELS.items()):
+            ts = meta.get("ts")
+            if ts and (now - ts) > TTL_PANEL_SECONDS:
+                PANELS.pop(k, None)
+    except Exception:
+        ...
+
     try:
         cur=SINGLETON_CONN.cursor(); cur.execute("SELECT 1"); cur.fetchone(); return
     except Exception as e:
@@ -948,42 +979,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = await panel_open_initial(update, context, "ثبت رابطه — @یوزرنیم یا آیدی عددی طرف مقابل را بفرست", rows, root=True)
                 REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
                 return
-
-    # waiting for username/id in relationship
-    key_wait=(update.effective_chat.id, update.effective_user.id)
-    if REL_USER_WAIT.get(key_wait):
-        sel=text.strip()
-        if sel in ("لغو","انصراف"):
-            REL_USER_WAIT.pop(key_wait, None)
-            await reply_temp(update, context, "لغو شد."); 
-            return
-        with SessionLocal() as s2:
-            g=ensure_group(s2, update.effective_chat); me=upsert_user(s2, g.id, update.effective_user)
-            target_user=None
-            if sel.startswith("@"):
-                uname=sel[1:].lower()
-                target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
-            else:
-                try:
-                    tgid=int(sel)
-                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
-                except Exception: target_user=None
-            if not target_user:
-                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن.", keep=True); 
-                return
-            if target_user.tg_user_id==update.effective_user.id:
-                await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
-                return
-            REL_USER_WAIT.pop(key_wait, None)
-            _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
-            y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
-            for ch in chunked(years,4):
-                rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
-            rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
-            await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
-        return
-
-    # birthday set
+    # birthday set# birthday set
     m=re.match(r"^ثبت تولد ([\d\/\-]+)$", text)
     if m:
         date_str=m.group(1)
