@@ -2718,6 +2718,24 @@ async def cb_rel_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Unified text router + lightweight debug log
+    try:
+        if not update.message or not update.message.text:
+            return
+        txt = update.message.text
+        chat_type = getattr(update.effective_chat, "type", None)
+        logging.info(f"[on_text] chat_type={chat_type} user={update.effective_user.id if update.effective_user else None} text={txt[:64]!r}")
+        # Avoid catching slash commands; let CommandHandlers take them
+        if txt.startswith('/'):
+            return
+        if chat_type in ("group","supergroup"):
+            await on_group_text(update, context)
+        elif chat_type == "private":
+            await on_private_text(update, context)
+    except Exception as e:
+        logging.exception(f"on_text error: {e}")
 def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
     acquire_singleton_or_exit()
@@ -2726,8 +2744,11 @@ def main():
 
     # Handlers (text-only)
     app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
+    # replaced: group text handler
+    # app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
+    # replaced: private text handler
+    # app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
+    app.add_handler(MessageHandler(filters.TEXT, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
