@@ -118,6 +118,7 @@ if not INSTANCE_TAG:
     INSTANCE_TAG = hashlib.blake2b(f"{os.getenv('RAILWAY_SERVICE_NAME','')}-{os.getpid()}".encode(), digest_size=4).hexdigest()
 
 DEFAULT_TZ = "Asia/Tehran"
+SKIP_PROFILE_PHOTO = os.getenv("SKIP_PROFILE_PHOTO", "1").strip().lower() in ("1","true","yes")
 TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
 
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
@@ -342,7 +343,12 @@ with engine.begin() as conn:
         CREATE UNIQUE INDEX IF NOT EXISTS ix_users_chat_tg ON users (chat_id, tg_user_id);
         CREATE INDEX IF NOT EXISTS ix_ship_chat_date ON ship_history (chat_id, date);
         CREATE UNIQUE INDEX IF NOT EXISTS ix_ga_unique ON group_admins (chat_id, tg_user_id);
-    """))
+    """
+with engine.begin() as conn:
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_chat_last_seen ON users (chat_id, last_seen)"))
+with engine.begin() as conn:
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_chat_gender ON users (chat_id, gender)"))
+))
 # --- Self-healing for collation mismatch (safe to run; skips if not needed) ---
 def _db_self_heal_collation(engine):
     try:
@@ -630,16 +636,19 @@ def acquire_singleton_or_exit():
             time.sleep(interval)
             waited += interval
 
-    
     @atexit.register
     def _unlock():
         try:
-            if SINGLETON_CONN:
-                cur = SINGLETON_CONN.cursor()
-                cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
-                SINGLETON_CONN.close()
+            cur = SINGLETON_CONN.cursor()
+            cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
+            SINGLETON_CONN.close()
         except Exception:
             ...
+    def _unlock():
+        try:
+            cur=SINGLETON_CONN.cursor(); cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,)); SINGLETON_CONN.close()
+        except Exception: ...
+
 async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
     if not ENFORCE_SINGLETON: return
     global SINGLETON_CONN, SINGLETON_KEY
@@ -689,16 +698,15 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
 
 def user_help_text() -> str:
     return (
-        "📘 راهنمای حرفه‌ای فضول:\n"
-        "• «فضول منو» → منوی اصلی ربات (متنی).\n"
-        "• «ثبت جنسیت دختر/پسر» — ادمین می‌تواند برای دیگران با ریپلای ثبت کند.\n"
-        "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» — ادمین: با ریپلای برای دیگران.\n"
-        "• «ثبت رل [@یوزرنیم|آیدی]» یا با ریپلای → بعد از انتخاب فرد، سال/ماه/روز را انتخاب کن.\n"
-        "  همچنین «شروع رابطه [امروز|YYYY/MM/DD]» هم پشتیبانی می‌شود.\n"
-        "• «کراشام» — لیست کراش‌ها | «ثبت کراش» / «حذف کراش» (با ریپلای/@/آیدی).\n"
-        "• «ایدی» — پروفایل کامل + محبوبیت امروز (۰ تا ۱۰).\n"
-        "• «محبوب امروز»، «شیپم کن»، «شیپ امشب».\n"
-        "• تنظیمات گروه فقط برای مالک/فروشنده است و برای بقیه در «فضول منو» نمایش داده نمی‌شود.\n"
+        "📘 راهنمای سریع:\n"
+        "• «فضول» → تست سلامت\n"
+        "• «فضول منو» → منوی دکمه‌ای\n"
+        "• «ثبت جنسیت دختر/پسر» (ادمین: با ریپلای برای دیگران)\n"
+        "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» (ادمین: با ریپلای برای دیگران)\n"
+        "• «ثبت رابطه» → انتخاب از لیست/جستجو → سال/ماه/روز\n"
+        "• «کراشام» → لیست کراش‌ها\n"
+        "• «ایدی» → پروفایل کامل + محبوبیت\n"
+        "• «محبوب امروز»، «شیپم کن»، «شیپ امشب»\n"
     )
 
 
@@ -1373,9 +1381,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             me = upsert_user(s3, g.id, update.effective_user)
             # ذخیره سمت DB (ساخت جفت مرتب user_a/user_b)
             ua, ub = (me.id, target_user.id) if me.id < target_user.id else (target_user.id, me.id)
-            rel = s3.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==ua, Relationship.user_b_id==ub)).scalar_one_or_none()
+            rel = s3.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_id==ua, Relationship.user_b_id==ub)).scalar_one_or_none()
             if not rel:
-                rel = Relationship(chat_id=g.id, user_a_id=ua, user_b_id=ub, started_at=gdate); s3.add(rel)
+                rel = Relationship(chat_id=g.id, user_id=ua, user_b_id=ub, started_at=gdate); s3.add(rel)
             else:
                 rel.started_at = gdate
             s3.commit()
@@ -1488,7 +1496,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mentions=[mention_of(u) for u in users]
         buf=""; out=[]
         for m_ in mentions:
-            if len(buf)+len(m_)+1>3500:
+            if len(buf)+len(m_)+1>3000:
                 out.append(buf); buf=""
             buf += ("" if not buf else " ") + m_
         if buf: out.append(buf)
@@ -1523,15 +1531,17 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await reply_temp(update, context, "این بخش برای دیگران فقط مخصوص ادمین‌هاست."); return
             info = build_profile_caption(s2, g, target_user)
         try:
+            if not SKIP_PROFILE_PHOTO:
+        try:
             photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
             if photos.total_count>0:
                 file_id = photos.photos[0][-1].file_id
                 await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-            else:
-                await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+                return
         except Exception:
-            await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-        return
+            ...
+    await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+    return
     # (deprecated) داده‌های من → حالا از طریق «آیدی/ایدی» انجام می‌شود
     if text in ("داده های من","داده‌های من","ایدی داده های من"):
         text = "آیدی داده های من"
@@ -1568,7 +1578,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if me.gender not in ("male","female"):
                 await reply_temp(update, context, "اول جنسیتت رو ثبت کن: «ثبت جنسیت دختر/پسر»."); return
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
-            in_rel=set([r.user_a_id for r in rels]+[r.user_b_id for r in rels])
+            in_rel=set([r.user_id for r in rels]+[r.user_b_id for r in rels])
             if me.id in in_rel:
                 await reply_temp(update, context, "تو در رابطه‌ای. برای پیشنهاد باید سینگل باشی."); return
             opposite="female" if me.gender=="male" else "male"
@@ -1591,7 +1601,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u=s2.execute(select(User).where(User.chat_id==update.effective_chat.id, User.tg_user_id==update.effective_user.id)).scalar_one_or_none()
             if not u: await reply_temp(update, context, "اطلاعاتی از شما نداریم."); return
             s2.execute(Crush.__table__.delete().where((Crush.chat_id==update.effective_chat.id)&((Crush.from_user_id==u.id)|(Crush.to_user_id==u.id))))
-            s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==update.effective_chat.id)&((Relationship.user_a_id==u.id)|(Relationship.user_b_id==u.id))))
+            s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==update.effective_chat.id)&((Relationship.user_id==u.id)|(Relationship.user_b_id==u.id))))
             s2.execute(ReplyStatDaily.__table__.delete().where((ReplyStatDaily.chat_id==update.effective_chat.id)&(ReplyStatDaily.target_user_id==u.id)))
             s2.execute(User.__table__.delete().where((User.chat_id==update.effective_chat.id)&(User.id==u.id)))
             s2.commit()
@@ -1732,7 +1742,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
             males=s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females=s.query(User).filter_by(chat_id=g.id, gender="female").all()
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
-            in_rel=set([r.user_a_id for r in rels]+[r.user_b_id for r in rels])
+            in_rel=set([r.user_id for r in rels]+[r.user_b_id for r in rels])
             males=[u for u in males if u.id not in in_rel]; females=[u for u in females if u.id not in in_rel]
             if males and females:
                 muser=random.choice(males); fuser=random.choice(females)
@@ -1757,7 +1767,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                 if not r.started_at: continue
                 rm, rd = to_jalali_md(r.started_at)
                 if rd==jd:
-                    ua, ub = s.get(User, r.user_a_id), s.get(User, r.user_b_id)
+                    ua, ub = s.get(User, r.user_id), s.get(User, r.user_b_id)
                     try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
@@ -1811,12 +1821,14 @@ def main():
 
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
-    # Handlers    # Prefer text-based menu
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول منو$"), send_text_menu), group=0)
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^(?:راهنما|help|کمک)$"), cmd_help), group=0)
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول$"), cmd_ping), group=0)
+    # Handlers
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("charge", cmd_charge))
+    app.add_handler(CommandHandler("help", cmd_help))
+
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.TEXT & ~filters.COMMAND, on_any_text_for_rel))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -1840,6 +1852,7 @@ def main():
 
 
 
+
 async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
         sellers = s.execute(select(Seller).order_by(Seller.id.asc())).scalars().all()
@@ -1850,252 +1863,5 @@ async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for se in sellers:
         status = "فعال" if se.is_active else "غیرفعال"
         lines.append(f"- آیدی عددی: {fa_digits(str(se.tg_user_id))} | وضعیت: {status} | یادداشت: {se.note or '-'}")
-    await safe_send(update.effective_chat.send_message, "\n".join(lines))
-
-# === New relationship commands ===
-REL_TARGET_WAIT = {}
-REL_DATE_WAIT = {}
-
-def jalali_today():
-    if HAS_PTOOLS:
-        return JalaliDate.today()
-    else:
-        # fallback to gregorian -> string similar
-        from datetime import date
-        d = date.today()
-        return d  # will be formatted by fmt_date_fa
-
-def fmt_date_fa(d):
-    try:
-        return fa_digits(f"{JalaliDate.fromdate(d).year}/{JalaliDate.fromdate(d).month:02d}/{JalaliDate.fromdate(d).day:02d}")
-    except Exception:
-        return str(d)
-
-
-async def cmd_start_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    args_text = (update.effective_message.text or "").strip()
-    import re as _relre
-    m = _relre.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", args_text)
-    use_keyboard = True
-    if "امروز" in args_text and not m:
-        from persiantools.jdatetime import JalaliDate
-        jd = JalaliDate.today()
-        y, mo, d = jd.year, jd.month, jd.day
-        use_keyboard = False
-    elif m:
-        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        use_keyboard = False
-
-    if not use_keyboard:
-        target_id = REL_DATE_WAIT.get((chat.id, user.id))
-        if not target_id:
-            await safe_send(chat.send_message, "اول با «ثبت رابطه» طرف مقابل را مشخص کن، بعد تاریخ را بده.")
-            return
-        from persiantools.jdatetime import JalaliDate
-        try:
-            jd = JalaliDate(y, mo, d)
-        except Exception:
-            await safe_send(chat.send_message, "تاریخ معتبر نیست. نمونه: 1403/05/24 یا بنویس «امروز».")
-            return
-        with SessionLocal() as s:
-            g = ensure_group(s, chat)
-            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user.id)).scalar_one_or_none()
-            if not me:
-                await safe_send(chat.send_message, "کاربر یافت نشد.")
-                return
-            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==me.id)).scalar_one_or_none()
-            if not rel:
-                rel = Relationship(chat_id=g.id, user_a_id=me.id, user_b_id=target_id, started_at=jd.to_gregorian())
-                s.add(rel)
-            else:
-                rel.user_b_id = target_id
-                rel.started_at = jd.to_gregorian()
-            s.commit()
-        REL_DATE_WAIT.pop((chat.id, user.id), None)
-        await safe_send(chat.send_message, f"✅ رابطه ثبت شد: {fa_digits(str(jd))}")
-        return
-
-    rows = []
-    from persiantools.jdatetime import JalaliDate
-    y = JalaliDate.today().year
-    years = list(range(y, y-16, -1))
-    for chnk in chunked(years, 4):
-        rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in chnk])
-    rows.append([InlineKeyboardButton("امروز", callback_data="rel:today")])
-    await safe_send(chat.send_message, "📅 تاریخ شروع رابطه را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
-
-async def cmd_set_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ثبت رابطه → از کاربر هدف می‌پرسیم (ریپلای/منشن/@/آیدی/اسم) و سپس تاریخ را با همون کیبورد باز می‌کنیم
-    chat = update.effective_chat
-    user = update.effective_user
-    await safe_send(chat.send_message, "نام/آیدی/@یوزرنیم یا با ریپلای به پیام طرف مقابل، فرد مورد نظر را مشخص کن.")
-    REL_TARGET_WAIT[(chat.id, user.id)] = True
-
-
-async def on_any_text_for_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    text = (msg.text or "").strip()
-    if not text:
-        return
-
-    # Normalize Persian/Arabic digits and separators
-    def _norm(s: str) -> str:
-        try:
-            return fa_digits(s, to_persian=False)
-        except Exception:
-            return s
-
-    tnorm = _norm(text)
-
-    # --- Text-first "ثبت رل" / "شروع رابطه" ---
-    patterns = [
-        r"^(?:ثبت\s*رل|شروع\s*رابطه)\s*(?P<who>@\w+|\d+)?\s*(?P<date>(?:\d{4}/\d{1,2}/\d{1,2}|امروز))?$",
-    ]
-    m = None
-    for p in patterns:
-        m = re.match(p, tnorm)
-        if m:
-            break
-    if not m:
-        # Also check if we're waiting for date from a previous step
-        wd = context.user_data.get("rel_waiting_date")
-        if wd and wd.get("from_id") == user.id:
-            await _commit_rel_by_text(update, context, wd.get("target_id"), tnorm)
-        return
-
-    # Resolve target user: reply > explicit @/id
-    target_id = None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        target_id = msg.reply_to_message.from_user.id
-    elif m.group("who"):
-        who = m.group("who")
-        if who.startswith("@"):
-            context.user_data["rel_username_hint"] = who[1:]
-        else:
-            try:
-                target_id = int(who)
-            except Exception:
-                target_id = None
-
-    if not target_id and not context.user_data.get("rel_username_hint"):
-        await safe_send(chat.send_message, "برای «ثبت رل»، با ریپلای روی پیام طرف مقابل بفرست، یا آیدی/یوزرنیمش رو بعد از دستور بنویس.")
-        return
-
-    date_text = m.group("date")
-    if not date_text:
-        context.user_data["rel_waiting_date"] = {
-            "chat_id": chat.id,
-            "from_id": user.id,
-            "target_id": target_id,
-        }
-        await safe_send(chat.send_message, "تاریخ شروع رابطه رو به‌صورت «YYYY/MM/DD» یا کلمه‌ی «امروز» بفرست.")
-        return
-
-    await _commit_rel_by_text(update, context, target_id, date_text)
-    return
-
-async def _commit_rel_by_text(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int|None, date_text: str):
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    t = fa_digits(date_text, to_persian=False) if date_text else ""
-    from datetime import date, datetime
-    greg = None
-    if t == "امروز":
-        greg = date.today()
-    else:
-        parts = re.split(r"[/-]", t)
-        try:
-            jy, jm, jd = map(int, parts[:3])
-        except Exception:
-            await safe_send(chat.send_message, "فرمت تاریخ معتبر نیست. نمونه‌ی درست: ۱۴۰۲/۰۲/۲۵ یا کلمه‌ی «امروز».")
-            return
-        try:
-            if "jalali_to_gregorian" in globals():
-                gy, gm, gd = jalali_to_gregorian(jy, jm, jd)
-                greg = date(gy, gm, gd)
-            elif HAS_PTOOLS:
-                from persiantools.jdatetime import JalaliDate
-                greg = JalaliDate(jy, jm, jd).to_gregorian()
-            else:
-                greg = date(jy + 621, jm, jd)
-        except Exception:
-            await safe_send(chat.send_message, "تبدیل تاریخ جلالی ناموفق بود. لطفاً بصورت YYYY/MM/DD بفرست یا «امروز».")
-            return
-
-    if not target_id and context.user_data.get("rel_username_hint"):
-        try:
-            context.user_data["desired_rel_date"] = greg
-            await cmd_set_rel(update, context)
-            return
-        except Exception:
-            await safe_send(chat.send_message, "شناسه کاربر پیدا نشد. با ریپلای روی پیامش «ثبت رل امروز» را بفرست.")
-            return
-
-    with SessionLocal() as s:
-        ua = ensure_user(s, user.id, user.first_name, user.last_name, user.username)
-        ub = ensure_user(s, target_id, None, None, None)
-        if "set_relationship" in globals():
-            set_relationship(s, ua.id, ub.id, greg)
-        else:
-            try:
-                rel = s.query(Relationship).filter(
-                    ((Relationship.a_user_id == ua.id) & (Relationship.b_user_id == ub.id)) |
-                    ((Relationship.a_user_id == ub.id) & (Relationship.b_user_id == ua.id))
-                ).one_or_none()
-            except Exception:
-                rel = None
-            if rel:
-                rel.start_date = greg
-            else:
-                rel = Relationship(a_user_id=ua.id, b_user_id=ub.id, start_date=greg)
-                s.add(rel)
-        s.commit()
-
-    jdate = fmt_date_fa(greg) if "fmt_date_fa" in globals() else fa_digits(greg.isoformat())
-    await safe_send(chat.send_message, f"✅ رل ثبت شد با تاریخ شروع {jdate}.")
-    context.user_data.pop("rel_waiting_date", None)
-    context.user_data.pop("rel_username_hint", None)
-    context.user_data.pop("desired_rel_date", None)
-
-
-
-async def send_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    is_op = is_operator(user.id)
-    base = [
-        "🧭 منوی متنی فضول:",
-        "• «ثبت جنسیت دختر/پسر»",
-        "• «ثبت تولد YYYY/MM/DD»",
-        "• «ثبت رل [ریپلای/@/آیدی] [YYYY/MM/DD|امروز]»",
-        "• «کراشام» | «ثبت کراش [ریپلای/@/آیدی]» | «حذف کراش [ریپلای/@/آیدی]»",
-        "• «ایدی» | «محبوب امروز» | «شیپم کن» | «شیپ امشب»",
-    ]
-    if is_op:
-        base += [
-            "",
-            "— بخش ادمین (فقط برای شما):",
-            "• «لیست گروه‌ها»، «تمدید/شارژ گروه»، «خروج از گروه»، «پاکسازی داده‌ها»",
-        ]
-    await safe_send(chat.send_message, "\n".join(base))
-
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update.effective_chat.send_message, "من اینجام 😉")
-
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as e:
-        import traceback, logging
-        logging.exception("Fatal error in main: %s", e)
-        raise
+    await safe_send(update.effective_chat.send_message, "
+".join(lines))
