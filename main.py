@@ -579,77 +579,50 @@ def _advisory_key() -> int:
 def _acquire_lock(conn, key: int) -> bool:
     cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)", (key,)); ok=cur.fetchone()[0]; return bool(ok)
 
-
-
 def acquire_singleton_or_exit():
-    """Acquire a Postgres advisory lock so only one bot instance runs.
-    Uses psycopg (v3) if available; otherwise falls back to psycopg2.
-    Never crashes silently; logs every step.
-    """
     import logging, time
-    thash = hashlib.blake2b((TOKEN or "").encode(), digest_size=6).hexdigest()
-    logging.info("TOKEN hash (last6)=%s INSTANCE_TAG=%r", thash, INSTANCE_TAG)
+    thash = hashlib.blake2b((TOKEN or '').encode(), digest_size=6).hexdigest()
+    logging.info('TOKEN hash (last6)=%s INSTANCE_TAG=%r', thash, INSTANCE_TAG)
     global SINGLETON_CONN, SINGLETON_KEY
     if not ENFORCE_SINGLETON:
-        logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled.")
+        logging.warning('⚠️ ALLOW_MULTI=1 → singleton guard disabled.')
         return
-
-    # compute 64-bit key
     SINGLETON_KEY = _advisory_key()
-    logging.info("Singleton key=%s", SINGLETON_KEY)
-
-    max_wait = int(os.getenv("SINGLETON_MAX_WAIT_SECONDS", "300"))
-    interval = max(1, int(os.getenv("SINGLETON_RETRY_INTERVAL", "5")))
+    logging.info('Singleton key=%s', SINGLETON_KEY)
+    max_wait = int(os.getenv('SINGLETON_MAX_WAIT_SECONDS', '300'))
+    interval = max(1, int(os.getenv('SINGLETON_RETRY_INTERVAL', '5')))
     waited = 0
-
-    # choose driver
-    _driver = None
     try:
-        import psycopg  # type: ignore
-        _driver = "psycopg"
+        import psycopg as _pg
+        drv = 'psycopg'
     except Exception:
-        try:
-            import psycopg2  # type: ignore
-            _driver = "psycopg2"
-        except Exception as e:
-            logging.error("❌ Neither psycopg nor psycopg2 available: %s", e)
-            raise
-
+        import psycopg2 as _pg
+        drv = 'psycopg2'
     while True:
         try:
-            if _driver == "psycopg":
-                import psycopg  # type: ignore
-                SINGLETON_CONN = psycopg.connect(DATABASE_URL, connect_timeout=10)
-            else:
-                import psycopg2  # type: ignore
-                SINGLETON_CONN = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            SINGLETON_CONN = _pg.connect(DATABASE_URL, connect_timeout=10)
             cur = SINGLETON_CONN.cursor()
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
+            cur.execute('SELECT pg_try_advisory_lock(%s)', (SINGLETON_KEY,))
             got = cur.fetchone()[0]
             if got:
-                logging.info("✅ Advisory lock acquired.")
+                logging.info('✅ Advisory lock acquired.')
                 break
-            try:
-                SINGLETON_CONN.close()
-            except Exception:
-                ...
+            try: SINGLETON_CONN.close()
+            except Exception: ...
         except Exception as e:
-            logging.warning("Lock attempt failed: %s", e)
-
+            logging.warning('Lock attempt failed: %s', e)
         if waited >= max_wait:
-            logging.error("❌ Could not acquire advisory lock in %ss; exiting.", max_wait)
+            logging.error('❌ Could not acquire advisory lock in %ss; exiting.', max_wait)
             raise SystemExit(0)
         wait_left = max_wait - waited
-        logging.warning("Another instance holds the lock. Sleep %ss (left %ss)...", interval, wait_left)
-        time.sleep(interval)
-        waited += interval
-
+        logging.warning('Another instance holds the lock. Sleep %ss (left %ss)...', interval, wait_left)
+        time.sleep(interval); waited += interval
     @atexit.register
     def _unlock():
         try:
             if SINGLETON_CONN:
                 cur = SINGLETON_CONN.cursor()
-                cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
+                cur.execute('SELECT pg_advisory_unlock(%s)', (SINGLETON_KEY,))
                 SINGLETON_CONN.close()
         except Exception:
             ...
@@ -1829,14 +1802,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_temp(update, context, user_help_text(), keep=True)
 
 def main():
-    logging.info('Boot sanity: env TELEGRAM_TOKEN=%s OWNER_ID=%s DB=%s', '***' if os.getenv('TELEGRAM_TOKEN') else 'MISSING', os.getenv('OWNER_ID','-'), 'set' if os.getenv('DATABASE_URL') else 'unset')
-    try:
-        from sqlalchemy import text as _sqltext
-        with engine.begin() as _conn:
-            _conn.execute(_sqltext('SELECT 1'))
-        logging.info('DB sanity OK (SELECT 1)')
-    except Exception as e:
-        logging.error('DB sanity FAILED: %s', e)
 
     if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
     acquire_singleton_or_exit()
@@ -1882,6 +1847,218 @@ async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["🧾 لیست فروشنده‌ها:"]
     for se in sellers:
-        status = "فعال" if se.is_active else "غیرفعال"
-        lines.append(f"- آیدی عددی: {fa_digits(str(se.tg_user_id))} | وضعیت: {status} | یادداشت: {se.note or '-'}")
+        uname = se.username or "-"
+        nm = se.name or "-"
+        lines.append(f"- {nm} | آیدی عددی: {fa_digits(str(se.tg_user_id))} | یوزرنیم: @{uname}")
     await safe_send(update.effective_chat.send_message, "\n".join(lines))
+
+# === New relationship commands ===
+REL_TARGET_WAIT = {}
+REL_DATE_WAIT = {}
+
+def jalali_today():
+    if HAS_PTOOLS:
+        return JalaliDate.today()
+    else:
+        # fallback to gregorian -> string similar
+        from datetime import date
+        d = date.today()
+        return d  # will be formatted by fmt_date_fa
+
+def fmt_date_fa(d):
+    try:
+        return fa_digits(f"{JalaliDate.fromdate(d).year}/{JalaliDate.fromdate(d).month:02d}/{JalaliDate.fromdate(d).day:02d}")
+    except Exception:
+        return str(d)
+
+
+async def cmd_start_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    args_text = (update.effective_message.text or "").strip()
+    import re as _relre
+    m = _relre.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", args_text)
+    use_keyboard = True
+    if "امروز" in args_text and not m:
+        from persiantools.jdatetime import JalaliDate
+        jd = JalaliDate.today()
+        y, mo, d = jd.year, jd.month, jd.day
+        use_keyboard = False
+    elif m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        use_keyboard = False
+
+    if not use_keyboard:
+        target_id = REL_DATE_WAIT.get((chat.id, user.id))
+        if not target_id:
+            await safe_send(chat.send_message, "اول با «ثبت رابطه» طرف مقابل را مشخص کن، بعد تاریخ را بده.")
+            return
+        from persiantools.jdatetime import JalaliDate
+        try:
+            jd = JalaliDate(y, mo, d)
+        except Exception:
+            await safe_send(chat.send_message, "تاریخ معتبر نیست. نمونه: 1403/05/24 یا بنویس «امروز».")
+            return
+        with SessionLocal() as s:
+            g = ensure_group(s, chat)
+            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user.id)).scalar_one_or_none()
+            if not me:
+                await safe_send(chat.send_message, "کاربر یافت نشد.")
+                return
+            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==me.id)).scalar_one_or_none()
+            if not rel:
+                rel = Relationship(chat_id=g.id, user_a_id=me.id, user_b_id=target_id, started_at=jd.to_gregorian())
+                s.add(rel)
+            else:
+                rel.user_b_id = target_id
+                rel.started_at = jd.to_gregorian()
+            s.commit()
+        REL_DATE_WAIT.pop((chat.id, user.id), None)
+        await safe_send(chat.send_message, f"✅ رابطه ثبت شد: {fa_digits(str(jd))}")
+        return
+
+    rows = []
+    from persiantools.jdatetime import JalaliDate
+    y = JalaliDate.today().year
+    years = list(range(y, y-16, -1))
+    for chnk in chunked(years, 4):
+        rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in chnk])
+    rows.append([InlineKeyboardButton("امروز", callback_data="rel:today")])
+    await safe_send(chat.send_message, "📅 تاریخ شروع رابطه را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
+
+async def cmd_set_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ثبت رابطه → از کاربر هدف می‌پرسیم (ریپلای/منشن/@/آیدی/اسم) و سپس تاریخ را با همون کیبورد باز می‌کنیم
+    chat = update.effective_chat
+    user = update.effective_user
+    await safe_send(chat.send_message, "نام/آیدی/@یوزرنیم یا با ریپلای به پیام طرف مقابل، فرد مورد نظر را مشخص کن.")
+    REL_TARGET_WAIT[(chat.id, user.id)] = True
+
+async def on_any_text_for_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    key = (chat.id, user.id)
+    if not REL_TARGET_WAIT.get(key):
+        return
+    selector = (update.effective_message.text or "").strip()
+    with SessionLocal() as s2:
+        g = ensure_group(s2, chat)
+        me = upsert_user(s2, g.id, user)
+        # تلاش برای پیدا کردن طرف مقابل
+        # مسیرهای موجود در کد اصلی: username, id, reply, name
+        target_user = None
+        msg = update.effective_message
+        if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+            r = msg.reply_to_message.from_user
+            target_user = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==r.id)).scalar_one_or_none()
+        if not target_user and selector.startswith("@"):
+            uname=selector[1:].lower()
+            target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
+        if not target_user and selector.isdigit():
+            try:
+                tgid=int(selector)
+                target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
+            except Exception:
+                target_user=None
+        if not target_user:
+            # try fuzzy on first_name
+            like = f"%{normalize_username(selector)}%"
+            target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(func.coalesce(User.first_name,"")) .ilike(like))).scalar_one_or_none()
+
+        if not target_user:
+            await safe_send(chat.send_message, "کاربر پیدا نشد. دوباره تلاش کن یا با ریپلای مشخص کن.")
+            return
+        if target_user.tg_user_id == user.id:
+            await safe_send(chat.send_message, "نمی‌تونی با خودت رابطه ثبت کنی.")
+            REL_TARGET_WAIT.pop(key, None)
+            return
+        # ذخیرهٔ انتخاب و باز کردن کیبورد تاریخ
+        REL_DATE_WAIT[key] = target_user.id
+        REL_TARGET_WAIT.pop(key, None)
+    await cmd_start_rel(update, context)
+
+async def cb_rel_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = q.data or ""
+    chat = q.message.chat
+    user_id = q.from_user.id
+    if not data.startswith("rel:"):
+        return
+    await q.answer()
+    if data == "rel:today":
+        # ثبت تاریخ امروز
+        with SessionLocal() as s:
+            g = ensure_group(s, chat)
+            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user_id)).scalar_one_or_none()
+            target_id = REL_DATE_WAIT.get((chat.id, user_id))
+            if not (me and target_id):
+                await safe_send(q.message.edit_text, "ابتدا دستور «ثبت رابطه» را بزن و فرد را مشخص کن.")
+                return
+            today = JalaliDate.today()
+            # ذخیره در مدل Relationship مطابق کد اصلی
+            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==me.id)).scalar_one_or_none()
+            if not rel:
+                rel = Relationship(chat_id=g.id, user_a_id=me.id, user_b_id=target_id, started_at=today.to_gregorian())
+                s.add(rel)
+            else:
+                rel.user_b_id=target_id
+                rel.started_at=today.to_gregorian()
+            s.commit()
+            await safe_send(q.message.edit_text, f"✅ رابطه ثبت شد: {fa_digits(str(today))}")
+        return
+    m = re.match(r"rel:y:(\d+)", data)
+    if m:
+        y = int(m.group(1))
+        # ساخت ماه‌ها
+        rows = []
+        months = list(range(1,13))
+        for ch in chunked(months, 4):
+            rows.append([InlineKeyboardButton(fa_digits(str(mm)), callback_data=f"rel:m:{y}:{mm}") for mm in ch])
+        rows.append([InlineKeyboardButton("امروز", callback_data="rel:today")])
+        await safe_send(q.message.edit_text, f"سال {fa_digits(str(y))} — ماه را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows))
+        return
+    m = re.match(r"rel:m:(\d+):(\d+)", data)
+    if m:
+        y = int(m.group(1)); mth=int(m.group(2))
+        # روزهای ماه جلالی
+        import calendar
+        # تعداد روزهای ماه جلالی از persiantools
+        try:
+            from persiantools.jdatetime.calendar import JalaliCalendar
+            days = JalaliCalendar.get_days_in_month(y, mth)
+        except Exception:
+            days = 31
+        rows = []
+        for i in range(1, days+1, 7):
+            rows.append([InlineKeyboardButton(fa_digits(str(d)), callback_data=f"rel:d:{y}:{mth}:{d}") for d in range(i, min(i+7, days+1))])
+        rows.append([InlineKeyboardButton("امروز", callback_data="rel:today")])
+        await safe_send(q.message.edit_text, f"{fa_digits(str(y))}/{fa_digits(str(mth))} — روز را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows))
+        return
+    m = re.match(r"rel:d:(\d+):(\d+):(\d+)", data)
+    if m:
+        y=int(m.group(1)); mth=int(m.group(2)); d=int(m.group(3))
+        from persiantools.jdatetime import JalaliDate
+        jd = JalaliDate(y, mth, d)
+        with SessionLocal() as s:
+            g = ensure_group(s, chat)
+            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user_id)).scalar_one_or_none()
+            target_id = REL_DATE_WAIT.get((chat.id, user_id))
+            if not (me and target_id):
+                await safe_send(q.message.edit_text, "ابتدا دستور «ثبت رابطه» را بزن و فرد را مشخص کن.")
+                return
+            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==me.id)).scalar_one_or_none()
+            if not rel:
+                rel = Relationship(chat_id=g.id, user_a_id=me.id, user_b_id=target_id, started_at=jd.to_gregorian())
+                s.add(rel)
+            else:
+                rel.user_b_id=target_id
+                rel.started_at=jd.to_gregorian()
+            s.commit()
+        await safe_send(q.message.edit_text, f"✅ رابطه ثبت شد: {fa_digits(str(jd))}")
+        REL_DATE_WAIT.pop((chat.id, user_id), None)
+        return
+    
+
+if __name__ == "__main__":
+    main()
