@@ -12,44 +12,6 @@
 # - Polling mode with webhook deletion, PG advisory singleton
 # Requires: python-telegram-bot[job-queue]>=21, SQLAlchemy, psycopg[binary], persiantools
 
-
-# === DSN Resolver (injected) ===
-def _resolve_db_dsn() -> str:
-    """
-    Resolve a PostgreSQL DSN robustly.
-    Priority:
-      1) module-global DATABASE_URL
-      2) engine.url (if an SQLAlchemy engine exists)
-      3) os.environ["DATABASE_URL"]
-      4) Build from PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE (+ sslmode=require by default)
-    """
-    try:
-        dburl = globals().get("DATABASE_URL")
-        if dburl:
-            return dburl
-    except Exception:
-        ...
-    try:
-        eng = globals().get("engine")
-        if eng:
-            return str(eng.url)
-    except Exception:
-        ...
-    import os as _os
-    env_dsn = _os.getenv("DATABASE_URL")
-    if env_dsn:
-        return env_dsn
-    host = _os.getenv("PGHOST")
-    db   = _os.getenv("PGDATABASE")
-    user = _os.getenv("PGUSER")
-    pwd  = _os.getenv("PGPASSWORD")
-    port = _os.getenv("PGPORT", "5432")
-    if host and db and user and pwd:
-        sslmode = _os.getenv("PGSSLMODE", "require")
-        return f"postgresql://{user}:{pwd}@{host}:{port}/{db}?sslmode={sslmode}"
-    raise RuntimeError("No DATABASE_URL or PG* variables found; set DATABASE_URL or PGHOST/PGUSER/PGPASSWORD/PGDATABASE")
-# === End DSN Resolver (injected) ===
-
 import os
 import re
 # -*- coding: utf-8 -*-
@@ -735,22 +697,32 @@ def user_help_text() -> str:
         "• «فضول منو» → منوی دکمه‌ای\n"
         "• «ثبت جنسیت دختر/پسر» (ادمین: با ریپلای برای دیگران)\n"
         "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» (ادمین: با ریپلای برای دیگران)\n"
-        "• «ثبت رابطه» → انتخاب از لیست/جستجو → سال/ماه/روز\n"
+        "• «ثبت رابطه» → انتخاب از لیست/جستجو → سال/ماه/روز
+• ادمین: «@user1 رل @user2» یا «123456 رل 789012» (تاریخ اختیاری)\n"
         "• «کراشام» → لیست کراش‌ها\n"
         "• «ایدی» → پروفایل کامل + محبوبیت\n"
         "• «محبوب امروز»، «شیپم کن»، «شیپ امشب»\n"
     )
 
 
+
 async def notify_owner(context, text: str):
+    """
+    Sends an owner PV report. Any 7+ digit user IDs inside the text will be
+    replaced with clickable mentions. If the text contains a pattern like
+    "گروه <id>" we will also try to resolve the names from the group DB and
+    use mention-with-name (e.g., <a href="tg://user?id=123">Ali</a>) instead
+    of raw digits.
+    """
     try:
         if not OWNER_ID:
             return
         import re as _re
-        # detect group id like "گروه -1001234567890"
         group_id = None
-        m = _re.search(r"(?:گروه|group)\s+(-?\d{6,})", text)
         chat_title = None; chat_username = None; invite_link = None
+
+        # Detect group id like "گروه -1001234567890" or "group -100..."
+        m = _re.search(r"(?:گروه|group)\s+(-?\d{6,})", text)
         if m:
             try:
                 group_id = int(m.group(1))
@@ -762,19 +734,41 @@ async def notify_owner(context, text: str):
                     text = text.replace(m.group(0), f"گروه {chat_title}")
             except Exception:
                 group_id = None
-        # autolink user IDs (7+ digits, positive)
-        def _mentionify(mt):
-            uid = mt.group(0)
+
+        # Build replacements for all positive 7+ digit numbers
+        ids = set(_re.findall(r"(?<!-)\b\d{7,}\b", text))
+        replacements = {}
+        if ids:
             try:
-                if uid.startswith("0"):
-                    return uid
-                if len(uid) >= 7:
-                    return f'<a href="tg://user?id={uid}">{uid}</a>'
+                with SessionLocal() as s:
+                    for sid in ids:
+                        name_html = None
+                        try:
+                            uid = int(sid)
+                        except Exception:
+                            uid = None
+                        if uid is not None and group_id:
+                            u = s.execute(select(User).where(User.chat_id==group_id, User.tg_user_id==uid)).scalar_one_or_none()
+                            if u:
+                                nm = u.first_name or (u.username and f"@{u.username}") or sid
+                                safe = _re.sub(r"[<>]", "", str(nm))
+                                name_html = f'<a href="tg://user?id={sid}">{safe}</a>'
+                        # Fallback: clickable digits
+                        if not name_html:
+                            name_html = f'<a href="tg://user?id={sid}">{sid}</a>'
+                        replacements[sid] = name_html
             except Exception:
-                pass
-            return uid
-        text_html = _re.sub(r"(?<!-)\b\d{7,}\b", _mentionify, text)
-        # prepare group button if resolvable
+                # Fallback: just clickable digits
+                for sid in ids:
+                    replacements[sid] = f'<a href="tg://user?id={sid}">{sid}</a>'
+
+        def _repl(mt):
+            sid = mt.group(0)
+            return replacements.get(sid, sid)
+
+        text_html = _re.sub(r"(?<!-)\b\d{7,}\b", _repl, text)
+
+        # Prepare group button if resolvable
         url = None
         try:
             if chat_username:
@@ -783,14 +777,15 @@ async def notify_owner(context, text: str):
                 url = invite_link
         except Exception:
             url = None
+
         kb = None
         if url:
             from telegram import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("ورود به گروه", url=url)]])
+
         await context.bot.send_message(OWNER_ID, text_html, disable_web_page_preview=False, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logging.warning(f"notify_owner failed: {e}")
-
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
@@ -1207,6 +1202,61 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total_cnt=s2.execute(select(func.count()).select_from(User).where(User.chat_id==g.id)).scalar() or 0
             if not rows_db:
                 await reply_temp(update, context, "کسی در لیست نیست. از «جستجو» استفاده کن یا از طرف مقابل بخواه یک پیام بدهد."); return
+    # --- Admin quick relationship setter: "@u1 رل @u2" or "id1 رل id2" (optional date at end) ---
+    m = re.match(r"^(?:ثبت\s+)?(@?\S+|\d+)\s+رل\s+(@?\S+|\d+)(?:\s+(امروز|[\d\/\-]+))?$", text)
+    if m:
+        with SessionLocal() as s2:
+            g = ensure_group(s2, update.effective_chat)
+            if not is_group_admin(s2, g.id, update.effective_user.id):
+                pass
+            else:
+                a_raw = m.group(1); b_raw = m.group(2); date_str = (m.group(3) or "").strip()
+                def _resolve(sel):
+                    u=None
+                    if sel.startswith("@"):
+                        uname = sel[1:].lower()
+                        u = s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
+                    else:
+                        try:
+                            tgid = int(sel)
+                            u = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
+                        except Exception:
+                            u=None
+                    return u
+                ua = _resolve(a_raw); ub = _resolve(b_raw)
+                if not (ua and ub):
+                    await reply_temp(update, context, "کاربر پیدا نشد. از آنها بخواه یک پیام بدهند.", keep=True)
+                    return
+                if ua.id == ub.id:
+                    await reply_temp(update, context, "نمی‌توان برای یک نفر با خودش رل ثبت کرد.")
+                    return
+                # Parse date
+                try:
+                    if not date_str or date_str == "امروز":
+                        if HAS_PTOOLS:
+                            gdate = JalaliDate.today().to_gregorian()
+                        else:
+                            gdate = dt.date.today()
+                    else:
+                        ss = fa_to_en_digits(date_str).replace("/","-")
+                        y,mn,dd = (int(x) for x in ss.split("-"))
+                        gdate = JalaliDate(y,mn,dd).to_gregorian() if HAS_PTOOLS else dt.date(2000 + (y%100), mn, dd)
+                except Exception:
+                    await reply_temp(update, context, "فرمت تاریخ نامعتبر است. نمونه: «@a رل @b ۱۴۰۳/۰۵/۲۰» یا «@a رل @b امروز».")
+                    return
+                # Remove previous relationships for both and insert new
+                s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==g.id) & ((Relationship.user_a_id==ua.id) | (Relationship.user_b_id==ua.id) | (Relationship.user_a_id==ub.id) | (Relationship.user_b_id==ub.id))))
+                a_id, b_id = (ua.id, ub.id) if ua.id < ub.id else (ub.id, ua.id)
+                s2.add(Relationship(chat_id=g.id, user_a_id=a_id, user_b_id=b_id, started_at=gdate))
+                s2.commit()
+                txt = f"✅ رابطه ثبت شد: {mention_of(ua)} × {mention_of(ub)} — از {fmt_date_fa(gdate)}"
+                await reply_temp(update, context, txt, parse_mode=ParseMode.HTML)
+                try:
+                    await notify_owner(context, f"[گزارش] رابطه در گروه {g.id} ثبت شد: {ua.tg_user_id} با {ub.tg_user_id} از {fmt_date_fa(gdate)}")
+                except Exception:
+                    pass
+                return
+
             btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:picktg:{u.tg_user_id}")] for u in rows_db]
             nav=[]
             if total_cnt > per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{1}"))
