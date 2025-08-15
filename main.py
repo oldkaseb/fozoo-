@@ -567,7 +567,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total_cnt > offset+per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{page+1}"))
         if nav: btns.append(nav)
         btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
-        await panel_edit(context, msg, user_id, "از لیست انتخاب کن", btns, root=False); return
+        await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True); return
 
 
     m=re.match(r"^rel:picktg:(\d+)$", data)
@@ -598,7 +598,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data=="rel:ask":
         REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp()}
-        await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
+        await panel_open_initial(update, context, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=True); return
 
     # --- Relationship date wizard ---
     m=re.match(r"^rel:yp:(\d+)$", data)
@@ -847,7 +847,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                 except Exception: target_user=None
             if not target_user:
-                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن."); 
+                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن.", keep=True); 
                 return
             if target_user.tg_user_id==update.effective_user.id:
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
@@ -980,7 +980,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                 except Exception: target_user=None
             if not target_user:
-                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن."); 
+                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن.", keep=True); 
                 return
             if target_user.tg_user_id==update.effective_user.id:
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
