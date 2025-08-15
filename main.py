@@ -337,10 +337,68 @@ with engine.begin() as conn:
         CREATE INDEX IF NOT EXISTS ix_ship_chat_date ON ship_history (chat_id, date);
         CREATE UNIQUE INDEX IF NOT EXISTS ix_ga_unique ON group_admins (chat_id, tg_user_id);
     """))
+# --- Self-healing for collation mismatch (safe to run; skips if not needed) ---
+def _db_self_heal_collation(engine):
+    try:
+        with engine.connect() as conn_ro:
+            # Get stored and actual collation versions for the DB default collation
+            row = conn_ro.exec_driver_sql(
+                """
+                SELECT d.datcollate,
+                       d.datcollversion AS stored,
+                       COALESCE(pg_collation_actual_version(c.oid), d.datcollversion) AS actual
+                FROM pg_database d
+                LEFT JOIN pg_collation c
+                  ON c.collname = d.datcollate
+                WHERE d.datname = current_database();
+                """
+            ).fetchone()
+        if not row:
+            return
+        datcollate, stored, actual = row
+        if stored and actual and stored != actual:
+            import logging as _log
+            _log.warning(f"⚠️ Detected collation mismatch: stored={stored} actual={actual} — attempting online reindex...")
+            # We need AUTOCOMMIT for REINDEX CONCURRENTLY and ALTER DATABASE
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                # Try to refresh the recorded collation version (non-blocking)
+                try:
+                    dbname = conn.exec_driver_sql("SELECT current_database()").scalar()
+                    conn.exec_driver_sql(f"ALTER DATABASE \"{dbname}\" REFRESH COLLATION VERSION")
+                except Exception as e:
+                    _log.warning(f"REFRESH COLLATION VERSION failed (non-fatal): {e}")
+                # Reindex only text/varchar/bpchar indexes concurrently to avoid long locks
+                try:
+                    idx_rows = conn.exec_driver_sql(
+                        """
+                        SELECT DISTINCT i.relname
+                        FROM pg_index x
+                        JOIN pg_class i ON i.oid = x.indexrelid
+                        JOIN pg_class t ON t.oid = x.indrelid
+                        JOIN pg_namespace n ON n.oid = i.relnamespace
+                        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(x.indkey)
+                        JOIN pg_type ty ON ty.oid = a.atttypid
+                        WHERE n.nspname = 'public'
+                          AND ty.typname IN ('text','varchar','bpchar');
+                        """
+                    ).fetchall()
+                    for (idxname,) in idx_rows:
+                        try:
+                            conn.exec_driver_sql(f'REINDEX INDEX CONCURRENTLY "{idxname}"')
+                        except Exception as e:
+                            _log.warning(f"REINDEX {idxname} failed (skipped): {e}")
+                except Exception as e:
+                    _log.warning(f"Index discovery failed (skipped): {e}")
+    except Exception as e:
+        import logging as _log
+        _log.warning(f"Self-heal collation check skipped: {e}")
+
+# Run it once at startup (after create_all / index creation)
+_db_self_heal_collation(engine)
 
 def is_seller(session, tg_user_id: int) -> bool:
     try:
-        s = session.query(Seller).filter_by(tg_user_a_id=tg_user_id, is_active=True).first()
+        s = session.query(Seller).filter_by(tg_user_id=tg_user_id, is_active=True).first()
         return bool(s)
     except Exception:
         return False
@@ -348,7 +406,7 @@ def is_seller(session, tg_user_id: int) -> bool:
 def is_group_admin(session, chat_id: int, tg_user_id: int) -> bool:
     if tg_user_id == OWNER_ID:
         return True
-    row = session.execute(select(GroupAdmin).where(GroupAdmin.chat_id==chat_id, GroupAdmin.tg_user_a_id==tg_user_id)).scalar_one_or_none()
+    row = session.execute(select(GroupAdmin).where(GroupAdmin.chat_id==chat_id, GroupAdmin.tg_user_id==tg_user_id)).scalar_one_or_none()
     return bool(row)
 
 def is_operator(session, tg_user_id: int) -> bool:
@@ -369,7 +427,7 @@ def mention_of(u: "User") -> str:
 
 
 def build_profile_caption(s, g, me) -> str:
-    my_crushes = s.query(Crush).filter_by(chat_id=g.id, from_user_a_id=me.id).all()
+    my_crushes = s.query(Crush).filter_by(chat_id=g.id, from_user_id=me.id).all()
     crush_list = []
     for r in my_crushes[:20]:
         u = s.get(User, r.to_user_id)
@@ -383,7 +441,7 @@ def build_profile_caption(s, g, me) -> str:
         if other_name:
             rel_txt = f"{other_name} — از {fmt_date_fa(rel.started_at)}"
     today=dt.datetime.now(TZ_TEHRAN).date()
-    my_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today, ReplyStatDaily.target_user_a_id==me.id)).scalar_one_or_none()
+    my_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today, ReplyStatDaily.target_user_id==me.id)).scalar_one_or_none()
     max_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today).order_by(ReplyStatDaily.reply_count.desc()).limit(1)).scalar_one_or_none()
     score=0
     if my_row and max_row and max_row.reply_count>0:
@@ -429,9 +487,9 @@ def ensure_group(session, chat) -> "Group":
     session.flush(); return g
 
 def upsert_user(session, chat_id: int, tg_user) -> "User":
-    u = session.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==tg_user.id)).scalar_one_or_none()
+    u = session.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tg_user.id)).scalar_one_or_none()
     if not u:
-        u = User(chat_id=chat_id, tg_user_a_id=tg_user.id)
+        u = User(chat_id=chat_id, tg_user_id=tg_user.id)
         session.add(u)
     u.first_name = tg_user.first_name or u.first_name
     u.last_name = tg_user.last_name or u.last_name
@@ -740,7 +798,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 mentions=[]
                 for ga in gas[:50]:
-                    u = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==ga.tg_user_id)).scalar_one_or_none()
+                    u = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==ga.tg_user_id)).scalar_one_or_none()
                     if u: mentions.append(mention_of(u))
                 txt="👥 ادمین‌های فضول:\n"+"\n".join(f"- {m}" for m in mentions)
         await panel_edit(context, msg, user_id, txt, [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False, parse_mode=ParseMode.HTML); return
@@ -766,7 +824,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if m:
         page=int(m.group(1)); per=10; offset=page*per
         with SessionLocal() as s:
-            me=s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==user_id)).scalar_one_or_none()
+            me=s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
             q=select(User).where(User.chat_id==chat_id)
             if me: q=q.where(User.id!=me.id)
             rows_db=s.execute(q.order_by(User.last_seen.desc().nullslast()).offset(offset).limit(per)).scalars().all()
@@ -786,11 +844,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if m:
         tgid=int(m.group(1))
         with SessionLocal() as s:
-            target = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==tgid)).scalar_one_or_none()
-            me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==user_id)).scalar_one_or_none()
+            target = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tgid)).scalar_one_or_none()
+            me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
         if not target or not me:
             await panel_edit(context, msg, user_id, "کاربر پیدا نشد. ممکن است از گروه خارج شده باشد.", [[InlineKeyboardButton("برگشت", callback_data="rel:list:0")]], root=False); return
-        if target.tg_user_a_id==user_id:
+        if target.tg_user_id==user_id:
             await panel_edit(context, msg, user_id, "نمی‌تونی با خودت رابطه ثبت کنی.", [[InlineKeyboardButton("برگشت", callback_data="rel:list:0")]], root=False); return
         _set_rel_wait(chat_id, user_id, target.id, target.tg_user_id)
         y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
@@ -800,7 +858,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
     m=re.match(r"^rel:pick:(\d+)$", data)
     if m:
-        target_user_a_id=int(m.group(1))
+        target_user_id=int(m.group(1))
         _set_rel_wait(chat_id, user_id, target_user_id)
         y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
         for ch in chunked(years,4):
@@ -847,12 +905,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await panel_edit(context, msg, user_id, "جلسه پیدا نشد. دوباره «ثبت رابطه» را بزن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
         target_user_id = ctx.get("target_user_id")
         with SessionLocal() as s:
-            me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==user_id)).scalar_one_or_none()
+            me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
             other = s.get(User, target_user_id) if target_user_id else None
             if not other:
                 tgid = ctx.get('target_tgid') if ctx else None
                 if tgid:
-                    other = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_a_id==tgid)).scalar_one_or_none()
+                    other = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tgid)).scalar_one_or_none()
             if not (me and other):
                 await panel_edit(context, msg, user_id, "کاربرها پیدا نشدند. از او بخواه یک پیام بدهد یا دوباره تلاش کن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
             try:
@@ -886,7 +944,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
             base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
             g.expires_at = base + dt.timedelta(days=days)
-            s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_a_id=user_id, action="extend", amount_days=days))
+            s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="extend", amount_days=days))
             s.commit()
             await panel_edit(context, msg, user_id, f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}",
                              [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False)
@@ -1011,7 +1069,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m:
             sid=int(m.group(1))
             with SessionLocal() as s:
-                row=s.query(Seller).filter_by(tg_user_a_id=sid, is_active=True).first()
+                row=s.query(Seller).filter_by(tg_user_id=sid, is_active=True).first()
                 if row: row.is_active=False; s.commit()
             await notify_owner(context, f"[گزارش] فروشنده {sid} عزل شد.")
             await panel_edit(context, msg, user_id, "فروشنده حذف شد.", [[InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:sellers")]], root=True); return
@@ -1090,12 +1148,12 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 try:
                     tgid=int(sel)
-                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==tgid)).scalar_one_or_none()
+                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                 except Exception: target_user=None
             if not target_user:
                 await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن.", keep=True); 
                 return
-            if target_user.tg_user_a_id==update.effective_user.id:
+            if target_user.tg_user_id==update.effective_user.id:
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
                 return
             REL_USER_WAIT.pop(key_wait, None)
@@ -1167,7 +1225,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target=upsert_user(s, g.id, update.effective_user)
             target.gender = "female" if gender_fa=="دختر" else "male"
             s.commit()
-            who="خودت" if target.tg_user_a_id==update.effective_user.id else f"{mention_of(target)}"
+            who="خودت" if target.tg_user_id==update.effective_user.id else f"{mention_of(target)}"
             await reply_temp(update, context, f"👤 جنسیت {who} ثبت شد: {'👧 دختر' if target.gender=='female' else '👦 پسر'}", parse_mode=ParseMode.HTML)
         return
 
@@ -1190,11 +1248,11 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     try:
                         tgid=int(selector)
-                        target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==tgid)).scalar_one_or_none()
+                        target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                     except Exception: target_user=None
             # if target_user already resolved, open date wizard now
             if target_user:
-                if target_user.tg_user_a_id==update.effective_user.id:
+                if target_user.tg_user_id==update.effective_user.id:
                     await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); return
                 _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
                 y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
@@ -1316,7 +1374,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 target=upsert_user(s, g.id, update.effective_user)
             target.birthday=gdate; s.commit()
-            who="خودت" if target.tg_user_a_id==update.effective_user.id else f"{mention_of(target)}"
+            who="خودت" if target.tg_user_id==update.effective_user.id else f"{mention_of(target)}"
             await reply_temp(update, context, f"🎂 تولد {who} ثبت شد: {fmt_date_fa(gdate)}", parse_mode=ParseMode.HTML)
         return
 
@@ -1336,7 +1394,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     try:
                         tgid = int(selector)
-                        target_user = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==tgid)).scalar_one_or_none()
+                        target_user = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                     except Exception:
                         target_user = None
             if not target_user:
@@ -1344,18 +1402,18 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if target_user.id == me.id:
                 await reply_temp(update, context, "نمی‌تونی روی خودت کراش بزنی."); return
 
-            existed = s2.execute(select(Crush).where(Crush.chat_id==g.id, Crush.from_user_a_id==me.id, Crush.to_user_a_id==target_user.id)).scalar_one_or_none()
+            existed = s2.execute(select(Crush).where(Crush.chat_id==g.id, Crush.from_user_id==me.id, Crush.to_user_id==target_user.id)).scalar_one_or_none()
             if action == "ثبت":
                 if existed:
                     await reply_temp(update, context, "از قبل کراش ثبت شده بود."); return
-                s2.add(Crush(chat_id=g.id, from_user_a_id=me.id, to_user_a_id=target_user.id))
+                s2.add(Crush(chat_id=g.id, from_user_id=me.id, to_user_id=target_user.id))
                 s2.commit()
                 await notify_owner(context, f"[گزارش] کراش ثبت شد: {me.tg_user_id} -> {target_user.tg_user_id} در گروه {g.id}")
                 await reply_temp(update, context, f"✅ کراش ثبت شد روی {mention_of(target_user)}", parse_mode=ParseMode.HTML); return
             else:
                 if not existed:
                     await reply_temp(update, context, "چیزی برای حذف پیدا نشد."); return
-                s2.execute(Crush.__table__.delete().where((Crush.chat_id==g.id)&(Crush.from_user_a_id==me.id)&(Crush.to_user_a_id==target_user.id)))
+                s2.execute(Crush.__table__.delete().where((Crush.chat_id==g.id)&(Crush.from_user_id==me.id)&(Crush.to_user_id==target_user.id)))
                 s2.commit()
                 await notify_owner(context, f"[گزارش] کراش حذف شد: {me.tg_user_id} -/-> {target_user.tg_user_id} در گروه {g.id}")
                 await reply_temp(update, context, f"🗑️ کراش حذف شد روی {mention_of(target_user)}", parse_mode=ParseMode.HTML); return
@@ -1363,7 +1421,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text=="کراشام":
         with SessionLocal() as s2:
             g=ensure_group(s2, update.effective_chat); me=upsert_user(s2, g.id, update.effective_user)
-            rows=s2.query(Crush).filter_by(chat_id=g.id, from_user_a_id=me.id).all()
+            rows=s2.query(Crush).filter_by(chat_id=g.id, from_user_id=me.id).all()
             if not rows:
                 await reply_temp(update, context, "هنوز کراشی ثبت نکردی."); return
             names=[]
@@ -1416,7 +1474,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 try:
                     tgid=int(selector)
-                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==tgid)).scalar_one_or_none()
+                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                 except Exception: target_user=None
             if not target_user:
                 await reply_temp(update, context, "کاربر پیدا نشد. ریپلای کن یا «آیدی داده های من» یا @/آیدی بده."); return
@@ -1483,18 +1541,18 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text in ("حریم خصوصی","داده های من کوتاه"):
         with SessionLocal() as s2:
-            u=s2.execute(select(User).where(User.chat_id==update.effective_chat.id, User.tg_user_a_id==update.effective_user.id)).scalar_one_or_none()
+            u=s2.execute(select(User).where(User.chat_id==update.effective_chat.id, User.tg_user_id==update.effective_user.id)).scalar_one_or_none()
             if not u: await reply_temp(update, context, "چیزی از شما ذخیره نشده."); return
             info=f"👤 نام: {u.first_name or ''} @{u.username or ''}\nجنسیت: {u.gender}\nتولد: {fmt_date_fa(u.birthday)}"
         await reply_temp(update, context, info); return
 
     if text=="حذف من":
         with SessionLocal() as s2:
-            u=s2.execute(select(User).where(User.chat_id==update.effective_chat.id, User.tg_user_a_id==update.effective_user.id)).scalar_one_or_none()
+            u=s2.execute(select(User).where(User.chat_id==update.effective_chat.id, User.tg_user_id==update.effective_user.id)).scalar_one_or_none()
             if not u: await reply_temp(update, context, "اطلاعاتی از شما نداریم."); return
-            s2.execute(Crush.__table__.delete().where((Crush.chat_id==update.effective_chat.id)&((Crush.from_user_a_id==u.id)|(Crush.to_user_a_id==u.id))))
+            s2.execute(Crush.__table__.delete().where((Crush.chat_id==update.effective_chat.id)&((Crush.from_user_id==u.id)|(Crush.to_user_id==u.id))))
             s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==update.effective_chat.id)&((Relationship.user_a_id==u.id)|(Relationship.user_b_id==u.id))))
-            s2.execute(ReplyStatDaily.__table__.delete().where((ReplyStatDaily.chat_id==update.effective_chat.id)&(ReplyStatDaily.target_user_a_id==u.id)))
+            s2.execute(ReplyStatDaily.__table__.delete().where((ReplyStatDaily.chat_id==update.effective_chat.id)&(ReplyStatDaily.target_user_id==u.id)))
             s2.execute(User.__table__.delete().where((User.chat_id==update.effective_chat.id)&(User.id==u.id)))
             s2.commit()
         await reply_temp(update, context, "✅ تمام داده‌های شما در این گروه حذف شد."); return
@@ -1505,8 +1563,8 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             today=dt.datetime.now(TZ_TEHRAN).date()
             target=upsert_user(s, g.id, update.message.reply_to_message.from_user)
             upsert_user(s, g.id, update.effective_user)
-            row=s.execute(select(ReplyStatDaily).where((ReplyStatDaily.chat_id==g.id)&(ReplyStatDaily.date==today)&(ReplyStatDaily.target_user_a_id==target.id))).scalar_one_or_none()
-            if not row: row=ReplyStatDaily(chat_id=g.id, date=today, target_user_a_id=target.id, reply_count=0); s.add(row)
+            row=s.execute(select(ReplyStatDaily).where((ReplyStatDaily.chat_id==g.id)&(ReplyStatDaily.date==today)&(ReplyStatDaily.target_user_id==target.id))).scalar_one_or_none()
+            if not row: row=ReplyStatDaily(chat_id=g.id, date=today, target_user_id=target.id, reply_count=0); s.add(row)
             row.reply_count += 1; s.commit()
 
 async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1547,11 +1605,11 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try: target_id=int(sel)
                 except Exception: await reply_temp(update, context, "فرمت نامعتبر. یک عدد بفرست.", keep=True); return
             with SessionLocal() as s2:
-                ex=s2.query(Seller).filter_by(tg_user_a_id=target_id, is_active=True).first()
+                ex=s2.query(Seller).filter_by(tg_user_id=target_id, is_active=True).first()
                 if ex: await reply_temp(update, context, "این فروشنده از قبل فعال است.", keep=True)
                 else:
-                    row=s2.query(Seller).filter_by(tg_user_a_id=target_id).first()
-                    if not row: row=Seller(tg_user_a_id=target_id, is_active=True); s2.add(row)
+                    row=s2.query(Seller).filter_by(tg_user_id=target_id).first()
+                    if not row: row=Seller(tg_user_id=target_id, is_active=True); s2.add(row)
                     else: row.is_active=True
                     s2.commit()
             SELLER_WAIT.pop(uid, None)
@@ -1638,7 +1696,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
             males=[u for u in males if u.id not in in_rel]; females=[u for u in females if u.id not in in_rel]
             if males and females:
                 muser=random.choice(males); fuser=random.choice(females)
-                s.add(ShipHistory(chat_id=g.id, date=today, male_user_a_id=muser.id, female_user_a_id=fuser.id)); s.commit()
+                s.add(ShipHistory(chat_id=g.id, date=today, male_user_id=muser.id, female_user_id=fuser.id)); s.commit()
                 try:
                     await context.bot.send_message(g.id, footer(f"💘 شیپِ امشب: {(muser.first_name or '@'+(muser.username or ''))} × {(fuser.first_name or '@'+(fuser.username or ''))}"))
                 except Exception: ...
@@ -1776,7 +1834,7 @@ async def cmd_start_rel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         with SessionLocal() as s:
             g = ensure_group(s, chat)
-            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==user.id)).scalar_one_or_none()
+            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user.id)).scalar_one_or_none()
             if not me:
                 await safe_send(chat.send_message, "کاربر یافت نشد.")
                 return
@@ -1824,14 +1882,14 @@ async def on_any_text_for_rel(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg = update.effective_message
         if msg and msg.reply_to_message and msg.reply_to_message.from_user:
             r = msg.reply_to_message.from_user
-            target_user = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==r.id)).scalar_one_or_none()
+            target_user = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==r.id)).scalar_one_or_none()
         if not target_user and selector.startswith("@"):
             uname=selector[1:].lower()
             target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
         if not target_user and selector.isdigit():
             try:
                 tgid=int(selector)
-                target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==tgid)).scalar_one_or_none()
+                target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
             except Exception:
                 target_user=None
         if not target_user:
@@ -1865,7 +1923,7 @@ async def cb_rel_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ثبت تاریخ امروز
         with SessionLocal() as s:
             g = ensure_group(s, chat)
-            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==user_id)).scalar_one_or_none()
+            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user_id)).scalar_one_or_none()
             target_id = REL_DATE_WAIT.get((chat.id, user_id))
             if not (me and target_id):
                 await safe_send(q.message.edit_text, "ابتدا دستور «ثبت رابطه» را بزن و فرد را مشخص کن.")
@@ -1917,7 +1975,7 @@ async def cb_rel_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jd = JalaliDate(y, mth, d)
         with SessionLocal() as s:
             g = ensure_group(s, chat)
-            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_a_id==user_id)).scalar_one_or_none()
+            me = s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==user_id)).scalar_one_or_none()
             target_id = REL_DATE_WAIT.get((chat.id, user_id))
             if not (me and target_id):
                 await safe_send(q.message.edit_text, "ابتدا دستور «ثبت رابطه» را بزن و فرد را مشخص کن.")
