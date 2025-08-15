@@ -1049,8 +1049,8 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             names=[]
             for r in rows[:20]:
                 u=s2.get(User, r.to_user_id)
-                if u: names.append(u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))
-            await reply_temp(update, context, "💘 کراش‌های تو:\n" + "\n".join(f"- {n}" for n in names), keep=True)
+                if u: names.append(mention_of(u))
+            await reply_temp(update, context, "💘 کراش‌های تو:\n" + "\n".join(f"- {n}" for n in names), keep=True, parse_mode=ParseMode.HTML)
         return
 
     if text in ("داده های من","داده‌های من"):
@@ -1063,13 +1063,13 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             crush_list=[]
             for r in my_crushes[:20]:
                 u=s2.get(User, r.to_user_id)
-                if u: crush_list.append(u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))
+                if u: crush_list.append(mention_of(u))
             rel=s2.query(Relationship).filter_by(chat_id=g.id).filter((Relationship.user_a_id==me.id)|(Relationship.user_b_id==me.id)).first()
             rel_txt="-"
             if rel:
                 other_id = rel.user_b_id if rel.user_a_id==me.id else rel.user_a_id
                 other = s2.get(User, other_id)
-                other_name = other and (other.first_name or (other.username and "@"+other.username) or str(other.tg_user_id))
+                other_name = other and mention_of(other)
                 rel_txt = f"{other_name or '-'} از {fmt_date_fa(rel.started_at) if rel.started_at else '-'}"
             today=dt.datetime.now(TZ_TEHRAN).date()
             my_row=s2.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today, ReplyStatDaily.target_user_id==me.id)).scalar_one_or_none()
@@ -1085,7 +1085,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"رابطه: {rel_txt}\n"
                 f"محبوبیت امروز: {score}/10"
             )
-            await reply_temp(update, context, info, keep=True)
+            await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML)
         return
 
     if text=="محبوب امروز":
@@ -1093,14 +1093,14 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as s2:
             rows=s2.execute(select(ReplyStatDaily).where((ReplyStatDaily.chat_id==update.effective_chat.id)&(ReplyStatDaily.date==today)).order_by(ReplyStatDaily.reply_count.desc()).limit(3)).scalars().all()
         if not rows:
-            await reply_temp(update, context, "امروز هنوز آماری نداریم.", keep=True); return
+            await reply_temp(update, context, "امروز هنوز آماری نداریم.", keep=True, parse_mode=ParseMode.HTML); return
         lines=[]
         with SessionLocal() as s3:
             for i,r in enumerate(rows, start=1):
                 u=s3.get(User, r.target_user_id)
-                name=u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
+                name=mention_of(u)
                 lines.append(f"{fa_digits(i)}) {name} — {fa_digits(r.reply_count)} ریپلای")
-        await reply_temp(update, context, "\n".join(lines), keep=True); return
+        await reply_temp(update, context, "\n".join(lines), keep=True, parse_mode=ParseMode.HTML); return
 
     if text=="شیپ امشب":
         today=dt.datetime.now(TZ_TEHRAN).date()
