@@ -1771,10 +1771,40 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_temp(update, context, user_help_text(), keep=True)
 
 def main():
+
     if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
     acquire_singleton_or_exit()
 
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
+
+    # Handlers
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("charge", cmd_charge))
+    app.add_handler(CommandHandler("help", cmd_help))
+
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_error_handler(error_handler)
+
+    app.add_handler(MessageHandler(filters.ALL, on_any), group=100)
+
+    # Jobs
+    jq = app.job_queue
+    if jq:
+        jq.run_daily(job_morning, time=dt.time(6,0,0,tzinfo=TZ_TEHRAN))
+        jq.run_daily(job_midnight, time=dt.time(0,1,0,tzinfo=TZ_TEHRAN))
+        jq.run_repeating(singleton_watchdog, interval=60, first=60)
+
+    # Start polling
+    logging.info("FazolBot running in POLLING mode…")
+    allowed = ["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"]
+    app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
+
+
 
 
 
@@ -1997,29 +2027,7 @@ async def cb_rel_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(q.message.edit_text, f"✅ رابطه ثبت شد: {fa_digits(str(jd))}")
         REL_DATE_WAIT.pop((chat.id, user_id), None)
         return
-    app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("panel", cmd_panel))
-    app.add_handler(CommandHandler("charge", cmd_charge))
-    app.add_handler(CommandHandler("help", cmd_help))
-
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_error_handler(error_handler)
-
-    app.add_handler(MessageHandler(filters.ALL, on_any), group=100)
-
-    jq=app.job_queue
-    if jq:
-        jq.run_daily(job_morning, time=dt.time(6,0,0,tzinfo=TZ_TEHRAN))
-        jq.run_daily(job_midnight, time=dt.time(0,1,0,tzinfo=TZ_TEHRAN))
-        jq.run_repeating(singleton_watchdog, interval=60, first=60)
-
-    logging.info("FazolBot running in POLLING mode…")
-    allowed=["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"]
-    app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
+    
 
 if __name__ == "__main__":
     main()
