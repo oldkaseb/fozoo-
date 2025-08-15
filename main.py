@@ -50,9 +50,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
-
-# --- Async & Send helpers (patch) ---
-import asyncio
+    Application, MessageHandler, CallbackQueryHandler, ChatMemberHandler,
+    CommandHandler, filters, ContextTypes
+)
+from telegram.error import Conflict as TgConflict
 import re as _re_patch
 from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
 
@@ -165,9 +166,6 @@ async def resolve_group_user(update, context, session, group_db_id: int, text_qu
             return tgt, "name"
     return None, "not_found"
 
-    Application, MessageHandler, CallbackQueryHandler, ChatMemberHandler,
-    CommandHandler, filters, ContextTypes
-)
 from telegram.error import Conflict as TgConflict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
