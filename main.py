@@ -586,22 +586,58 @@ def acquire_singleton_or_exit():
     global SINGLETON_CONN, SINGLETON_KEY
     if not ENFORCE_SINGLETON:
         logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled."); return
-    SINGLETON_KEY=_advisory_key(); logging.info(f"Singleton key = {SINGLETON_KEY}")
-    try:
-        SINGLETON_CONN = engine.raw_connection()
-        cur = SINGLETON_CONN.cursor()
-        app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
-        cur.execute("SET application_name = %s", (app_name,))
-        logging.info("application_name = %s", app_name)
-        ok = _acquire_lock(SINGLETON_CONN, SINGLETON_KEY)
-        if not ok:
-            logging.error("Another instance is already running (PG advisory lock). Exiting.")
-            os._exit(0)
-        logging.info("Singleton advisory lock acquired.")
-    except Exception as e:
-        logging.error(f"Singleton lock failed: {e}"); os._exit(0)
+
+    SINGLETON_KEY = _advisory_key()
+    logging.info(f"Singleton key = {SINGLETON_KEY}")
+    # Retry settings
+    max_wait = int(os.getenv("SINGLETON_MAX_WAIT_SECONDS", "300"))  # default 5min
+    interval = max(1, int(os.getenv("SINGLETON_RETRY_INTERVAL", "5")))
+    waited = 0
+
+    while True:
+        try:
+            SINGLETON_CONN = engine.raw_connection()
+            cur = SINGLETON_CONN.cursor()
+            app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
+            cur.execute("SET application_name = %s", (app_name,))
+            logging.info("application_name = %s", app_name)
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
+            ok = bool(cur.fetchone()[0])
+            if ok:
+                logging.info("Singleton advisory lock acquired.")
+                break
+            else:
+                if waited >= max_wait:
+                    logging.error("Could not acquire advisory lock after %ss; continuing WITHOUT singleton (set ALLOW_MULTI=0 to enforce).", waited)
+                    return
+                wait_left = max_wait - waited
+                logging.warning("Another instance holds the advisory lock. Waiting %ss (left %ss)...", interval, wait_left)
+                try:
+                    cur.close(); SINGLETON_CONN.close()
+                except Exception:
+                    pass
+                time.sleep(interval)
+                waited += interval
+                continue
+        except Exception as e:
+            logging.error(f"Singleton lock attempt failed: {e}")
+            try:
+                if SINGLETON_CONN: SINGLETON_CONN.close()
+            except Exception: ...
+            if waited >= max_wait:
+                logging.error("Exceeded max wait; continuing WITHOUT singleton.")
+                return
+            time.sleep(interval)
+            waited += interval
 
     @atexit.register
+    def _unlock():
+        try:
+            cur = SINGLETON_CONN.cursor()
+            cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
+            SINGLETON_CONN.close()
+        except Exception:
+            ...@atexit.register
     def _unlock():
         try:
             cur=SINGLETON_CONN.cursor(); cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,)); SINGLETON_CONN.close()
