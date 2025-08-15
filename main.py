@@ -765,6 +765,54 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
         return
 
+
+    # crush add/remove (reply / @username / numeric id)
+    m = re.match(r"^(ثبت|حذف) کراش(?:\s+(.+))?$", text)
+    if m:
+        action = m.group(1)
+        selector = (m.group(2) or "").strip()
+        with SessionLocal() as s2:
+            g = ensure_group(s2, update.effective_chat)
+            me = upsert_user(s2, g.id, update.effective_user)
+
+            # determine target
+            target_user = None
+            if update.message.reply_to_message:
+                target_user = upsert_user(s2, g.id, update.message.reply_to_message.from_user)
+            elif selector:
+                if selector.startswith("@"):
+                    target_user = s2.execute(select(User).where(User.chat_id==g.id, User.username==selector[1:])).scalar_one_or_none()
+                else:
+                    try:
+                        tgid = int(selector)
+                        target_user = s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
+                    except Exception:
+                        target_user = None
+
+            if not target_user:
+                await reply_temp(update, context, "طرف مقابل پیدا نشد. با ریپلای یا @یوزرنیم یا آیدی عددی دوباره امتحان کن.")
+                return
+            if target_user.id == me.id:
+                await reply_temp(update, context, "نمی‌تونی روی خودت کراش بزنی.")
+                return
+
+            existed = s2.execute(select(Crush).where(Crush.chat_id==g.id, Crush.from_user_id==me.id, Crush.to_user_id==target_user.id)).scalar_one_or_none()
+            if action == "ثبت":
+                if existed:
+                    await reply_temp(update, context, "از قبل کراش ثبت شده بود.")
+                    return
+                s2.add(Crush(chat_id=g.id, from_user_id=me.id, to_user_id=target_user.id))
+                s2.commit()
+                await reply_temp(update, context, f"✅ کراش ثبت شد روی {mention_of(target_user)}", parse_mode=ParseMode.HTML)
+            else:
+                if not existed:
+                    await reply_temp(update, context, "چیزی برای حذف پیدا نشد.")
+                    return
+                s2.execute(Crush.__table__.delete().where((Crush.chat_id==g.id)&(Crush.from_user_id==me.id)&(Crush.to_user_id==target_user.id)))
+                s2.commit()
+                await reply_temp(update, context, f"🗑️ کراش حذف شد روی {mention_of(target_user)}", parse_mode=ParseMode.HTML)
+        return
+
     # birthday set
     m=re.match(r"^ثبت تولد ([\d\/\-]+)$", text)
     if m:
