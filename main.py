@@ -579,6 +579,7 @@ def _advisory_key() -> int:
 def _acquire_lock(conn, key: int) -> bool:
     cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)", (key,)); ok=cur.fetchone()[0]; return bool(ok)
 
+
 def acquire_singleton_or_exit():
     import logging, time
     thash = hashlib.blake2b((TOKEN or '').encode(), digest_size=6).hexdigest()
@@ -587,36 +588,55 @@ def acquire_singleton_or_exit():
     if not ENFORCE_SINGLETON:
         logging.warning('⚠️ ALLOW_MULTI=1 → singleton guard disabled.')
         return
+
+    # Pick DSN robustly
+    try:
+        dsn = _resolve_db_dsn()
+    except Exception as e:
+        logging.error('❌ DB DSN resolution failed: %s', e)
+        raise
+
+    # compute advisory key
     SINGLETON_KEY = _advisory_key()
     logging.info('Singleton key=%s', SINGLETON_KEY)
+
     max_wait = int(os.getenv('SINGLETON_MAX_WAIT_SECONDS', '300'))
     interval = max(1, int(os.getenv('SINGLETON_RETRY_INTERVAL', '5')))
     waited = 0
+
+    # choose driver
     try:
         import psycopg as _pg
         drv = 'psycopg'
     except Exception:
-        import psycopg2 as _pg
-        drv = 'psycopg2'
+        try:
+            import psycopg2 as _pg
+            drv = 'psycopg2'
+        except Exception as ee:
+            logging.error('❌ Neither psycopg nor psycopg2 is available: %s', ee)
+            raise
+
     while True:
         try:
-            SINGLETON_CONN = _pg.connect(DATABASE_URL, connect_timeout=10)
+            SINGLETON_CONN = _pg.connect(dsn, connect_timeout=10)
             cur = SINGLETON_CONN.cursor()
             cur.execute('SELECT pg_try_advisory_lock(%s)', (SINGLETON_KEY,))
-            got = cur.fetchone()[0]
+            row = cur.fetchone()
+            got = bool(row[0]) if row else False
             if got:
-                logging.info('✅ Advisory lock acquired.')
+                logging.info('✅ Advisory lock acquired (driver=%s).', drv)
                 break
+            # Did not get the lock, close and wait
             try: SINGLETON_CONN.close()
             except Exception: ...
+            logging.warning('Another instance holds the lock. Sleep %ss…', interval)
         except Exception as e:
-            logging.warning('Lock attempt failed: %s', e)
+            logging.warning('Lock attempt failed (%s). Retry in %ss…', e, interval)
         if waited >= max_wait:
             logging.error('❌ Could not acquire advisory lock in %ss; exiting.', max_wait)
             raise SystemExit(0)
-        wait_left = max_wait - waited
-        logging.warning('Another instance holds the lock. Sleep %ss (left %ss)...', interval, wait_left)
         time.sleep(interval); waited += interval
+
     @atexit.register
     def _unlock():
         try:
