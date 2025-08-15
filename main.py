@@ -1093,11 +1093,28 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
                 rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
                 await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True); return
+            
             if not target_user:
-                rows=[[InlineKeyboardButton("انصراف", callback_data="nav:close")]]
-                msg = await panel_open_initial(update, context, "ثبت رابطه — @یوزرنیم یا آیدی عددی طرف مقابل را بفرست", rows, root=True)
+                # Open chooser LIST immediately (page 0)
+                page=0; per=10; offset=page*per
+                with SessionLocal() as s_list:
+                    me=upsert_user(s_list, g.id, update.effective_user)
+                    rows_db=s_list.execute(
+                        select(User).where(User.chat_id==g.id, User.id!=me.id)
+                        .order_by(func.lower(User.first_name).asc(), User.id.asc())
+                        .offset(offset).limit(per)
+                    ).scalars().all()
+                    total_cnt=s_list.execute(select(func.count()).select_from(User).where(User.chat_id==g.id)).scalar() or 0
+                btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:picktg:{u.tg_user_id}")] for u in rows_db]
+                nav=[]
+                if total_cnt > offset+per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{page+1}"))
+                if nav: btns.append(nav)
+                btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask"), InlineKeyboardButton("انصراف", callback_data="nav:close")])
+                msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
+                # Put user in waiting mode so further @/id text works too
                 REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
                 return
+
     # birthday set# birthday set
     m=re.match(r"^ثبت تولد ([\d\/\-]+)$", text)
     if m:
