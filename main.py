@@ -597,8 +597,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
 
     if data=="rel:ask":
-        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp()}
-        await panel_open_initial(update, context, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=True); return
+        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=False); return
 
     # --- Relationship date wizard ---
     m=re.match(r"^rel:yp:(\d+)$", data)
@@ -944,21 +944,10 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                     except Exception: target_user=None
             if not target_user:
-                rows=[
-                    [InlineKeyboardButton("👥 انتخاب از لیست", callback_data="rel:list:0")],
-                    [InlineKeyboardButton("🔎 جستجوی @یوزرنیم/آیدی", callback_data="rel:ask")],
-                ]
-                await panel_open_initial(update, context, "ثبت رابطه — طرف مقابل را انتخاب کن", rows, root=True)
+                rows=[[InlineKeyboardButton("انصراف", callback_data="nav:close")]]
+                msg = await panel_open_initial(update, context, "ثبت رابطه — @یوزرنیم یا آیدی عددی طرف مقابل را بفرست", rows, root=True)
+                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
                 return
-            if target_user.id==me.id:
-                await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); return
-            _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
-            y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
-            for ch in chunked(years,4):
-                rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
-            rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
-            await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
-        return
 
     # waiting for username/id in relationship
     key_wait=(update.effective_chat.id, update.effective_user.id)
