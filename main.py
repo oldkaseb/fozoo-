@@ -455,7 +455,7 @@ def build_profile_caption(s, g, me) -> str:
     )
     return info
 
-def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
+async def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                      reply_markup: InlineKeyboardMarkup | None = None, keep: bool = False,
                      parse_mode: Optional[str] = None, reply_to_message_id: Optional[int] = None,
                      with_footer: bool = True):
