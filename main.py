@@ -432,20 +432,15 @@ def mention_of(u: "User") -> str:
     return f'<a href="tg://user?id={u.tg_user_id}">{name}</a>'
 
 
+
 def build_profile_caption(s, g, me) -> str:
-    my_crushes = s.query(Crush).filter_by(chat_id=g.id, from_user_id=me.id).all()
-    crush_list = []
-    for r in my_crushes[:20]:
-        u = s.get(User, r.to_user_id)
-        if u: crush_list.append(mention_of(u))
     rel = s.query(Relationship).filter_by(chat_id=g.id).filter((Relationship.user_a_id==me.id)|(Relationship.user_b_id==me.id)).first()
     rel_txt = "-"
     if rel:
         other_id = rel.user_b_id if rel.user_a_id==me.id else rel.user_a_id
         other = s.get(User, other_id)
-        other_name = other and mention_of(other)
-        if other_name:
-            rel_txt = f"{other_name} — از {fmt_date_fa(rel.started_at)}"
+        if other:
+            rel_txt = f"{mention_of(other)} — از {fmt_date_fa(rel.started_at) if rel.started_at else '-'}"
     today=dt.datetime.now(TZ_TEHRAN).date()
     my_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today, ReplyStatDaily.target_user_id==me.id)).scalar_one_or_none()
     max_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today).order_by(ReplyStatDaily.reply_count.desc()).limit(1)).scalar_one_or_none()
@@ -455,16 +450,12 @@ def build_profile_caption(s, g, me) -> str:
     info=(
         f"👤 نام: {me.first_name or ''} @{me.username or ''}\n"
         f"جنسیت: {'دختر' if me.gender=='female' else ('پسر' if me.gender=='male' else 'نامشخص')}\n"
-        f"تولد: {fmt_date_fa(me.birthday)}\n"
-        f"کراش‌ها: {', '.join(crush_list) if crush_list else '-'}\n"
         f"رابطه: {rel_txt}\n"
-        f"محبوبیت امروز: {score}/10"
+        f"امتیاز تعامل امروز: {fa_digits(score)} از ۱۰\n"
     )
     return info
 
-def footer(text: str) -> str: return text
-
-async def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
+def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                      reply_markup: InlineKeyboardMarkup | None = None, keep: bool = False,
                      parse_mode: Optional[str] = None, reply_to_message_id: Optional[int] = None,
                      with_footer: bool = True):
@@ -1522,6 +1513,198 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
+    # ==== TEXT-ONLY COMMANDS (no menus) ====
+    # کمک/راهنما
+    if text.strip() in ("راهنما","کمک"):
+        await cmd_help(update, context); return
+
+    # پیکربندی (متنی)
+    if text.strip() in ("پیکربندی","تنظیمات"):
+        await cmd_config(update, context); return
+
+    with SessionLocal() as s:
+        g = ensure_group(s, update.effective_chat)
+        me = upsert_user(s, g.id, update.effective_user)
+        is_admin = is_group_admin(s, g.id, update.effective_user.id) or is_operator(s, update.effective_user.id)
+
+        # SELLERS
+        if text.startswith("افزودن فروشنده"):
+            if not is_operator(s, update.effective_user.id):
+                await reply_temp(update, context, "فقط مالک/فروشنده مجاز است."); return
+            arg = text.replace("افزودن فروشنده","",1).strip() or None
+            target = resolve_user_ref(s, g.id, update, arg)
+            if not target:
+                await reply_temp(update, context, "کاربر پیدا نشد. با ریپلای یا @یوزرنیم یا آیدی عددی امتحان کن."); return
+            row = s.query(Seller).filter_by(tg_user_id=target.tg_user_id).first()
+            if not row:
+                row = Seller(tg_user_id=target.tg_user_id, note=None, is_active=True); s.add(row)
+            else:
+                row.is_active = True
+            s.commit()
+            await reply_temp(update, context, f"✅ {mention_of(target)} به‌عنوان فروشنده فعال شد.", parse_mode=ParseMode.HTML); return
+
+        if text.startswith("حذف فروشنده"):
+            if not is_operator(s, update.effective_user.id):
+                await reply_temp(update, context, "فقط مالک/فروشنده مجاز است."); return
+            arg = text.replace("حذف فروشنده","",1).strip() or None
+            target = resolve_user_ref(s, g.id, update, arg)
+            if not target:
+                await reply_temp(update, context, "کاربر پیدا نشد."); return
+            row = s.query(Seller).filter_by(tg_user_id=target.tg_user_id).first()
+            if row:
+                row.is_active = False; s.commit()
+                await reply_temp(update, context, f"🗑️ فروشنده {mention_of(target)} غیرفعال شد.", parse_mode=ParseMode.HTML); return
+            await reply_temp(update, context, "این کاربر فروشنده نبود."); return
+
+        if text.strip() in ("فروشنده‌ها","فروشنده ها"):
+            if not is_operator(s, update.effective_user.id):
+                await reply_temp(update, context, "فقط مالک/فروشنده مجاز است."); return
+            rows = s.query(Seller).filter_by(is_active=True).all()
+            if not rows:
+                await reply_temp(update, context, "هیچ فروشندهٔ فعالی ثبت نشده."); return
+            lines = []
+            for se in rows[:50]:
+                u = s.execute(select(User).where(User.tg_user_id==se.tg_user_id, User.chat_id==g.id)).scalar_one_or_none()
+                nm = mention_of(u) if u else f"{se.tg_user_id}"
+                lines.append(f"• {nm}")
+            await reply_temp(update, context, "🛍️ فروشنده‌ها:\n" + "\n".join(lines), parse_mode=ParseMode.HTML, keep=True); return
+
+        # GROUPS list (OWNER ONLY)
+        if text.strip() in ("گروه‌ها","/groups"):
+            if update.effective_user.id != OWNER_ID:
+                await reply_temp(update, context, "این دستور مخصوص مالک است."); return
+            groups = s.query(Group).filter_by(is_active=True).limit(50).all()
+            out_lines = []
+            for gr in groups:
+                link = None
+                try:
+                    link_obj = await context.bot.create_chat_invite_link(gr.id, name="ورود", creates_join_request=False)
+                    link = link_obj.invite_link
+                except Exception:
+                    link = None
+                title = gr.title or str(gr.id)
+                if link:
+                    out_lines.append(f"• {fa_digits(title)} — {link}")
+                else:
+                    out_lines.append(f"• {fa_digits(title)} — (اجازهٔ دعوت لازم است)")
+            await reply_temp(update, context, "📋 گروه‌ها:\n" + "\n".join(out_lines), keep=True); return
+
+        # CONFIG shortcuts
+        if text.startswith("تنظیم مالک"):
+            if not is_admin:
+                await reply_temp(update, context, "فقط ادمین/مالک/فروشنده."); return
+            arg = text.replace("تنظیم مالک","",1).strip() or None
+            target = resolve_user_ref(s, g.id, update, arg)
+            if not target:
+                await reply_temp(update, context, "کاربر پیدا نشد."); return
+            g.owner_user_id = target.tg_user_id; s.commit()
+            await reply_temp(update, context, f"✅ مالک گروه روی {mention_of(target)} تنظیم شد.", parse_mode=ParseMode.HTML); return
+
+        if text.startswith("تنظیم منطقه‌زمان") or text.startswith("تنظیم منطقه زمان"):
+            if not is_admin:
+                await reply_temp(update, context, "فقط ادمین/مالک/فروشنده."); return
+            tz = text.split()[-1]
+            if tz in ("تهران","Tehran"): tz = "Asia/Tehran"
+            g.timezone = tz; s.commit()
+            await reply_temp(update, context, f"✅ منطقه‌زمان گروه: {tz}"); return
+
+        # REL add (admin-only)
+        import re as _re_mod
+        m = _re_mod.match(r"^رل\s+(\S+)\s+(\S+)$", text)
+        if m:
+            if not is_admin:
+                await reply_temp(update, context, "فقط ادمین مجاز است."); return
+            a = resolve_user_ref(s, g.id, update, m.group(1))
+            b = resolve_user_ref(s, g.id, update, m.group(2))
+            if not a or not b:
+                await reply_temp(update, context, "کاربر(ها) پیدا نشد."); return
+            if a.tg_user_id == b.tg_user_id:
+                await reply_temp(update, context, "نمی‌شود با خودِ کاربر رابطه ثبت کرد."); return
+            a,b = ensure_pair_order(a,b)
+            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==a.id, Relationship.user_b_id==b.id)).scalar_one_or_none()
+            if not rel:
+                rel = Relationship(chat_id=g.id, user_a_id=a.id, user_b_id=b.id, started_at=None); s.add(rel)
+            s.commit()
+            await reply_temp(update, context, f"💞 رابطه بین {mention_of(a)} و {mention_of(b)} ثبت شد.", parse_mode=ParseMode.HTML); return
+
+        m = _re_mod.match(r"^رل\s+(\S+)$", text)
+        if m and update.message.reply_to_message:
+            if not is_admin:
+                await reply_temp(update, context, "فقط ادمین مجاز است."); return
+            a = upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            b = resolve_user_ref(s, g.id, update, m.group(1))
+            if not b:
+                await reply_temp(update, context, "کاربر دوم پیدا نشد."); return
+            if a.tg_user_id == b.tg_user_id:
+                await reply_temp(update, context, "نمی‌شود با خودِ کاربر رابطه ثبت کرد."); return
+            a,b = ensure_pair_order(a,b)
+            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==a.id, Relationship.user_b_id==b.id)).scalar_one_or_none()
+            if not rel:
+                rel = Relationship(chat_id=g.id, user_a_id=a.id, user_b_id=b.id, started_at=None); s.add(rel)
+            s.commit()
+            await reply_temp(update, context, f"💞 رابطه بین {mention_of(a)} و {mention_of(b)} ثبت شد.", parse_mode=ParseMode.HTML); return
+
+        # REL delete
+        m = _re_mod.match(r"^(?:حذف\s*رل|حذف\s*رابطه)\s+(\S+)\s+(\S+)$", text)
+        if m:
+            if not is_admin:
+                await reply_temp(update, context, "فقط ادمین مجاز است."); return
+            a = resolve_user_ref(s, g.id, update, m.group(1))
+            b = resolve_user_ref(s, g.id, update, m.group(2))
+            if not a or not b:
+                await reply_temp(update, context, "کاربر(ها) پیدا نشد."); return
+            a,b = ensure_pair_order(a,b)
+            rel = s.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==a.id, Relationship.user_b_id==b.id)).scalar_one_or_none()
+            if rel:
+                s.delete(rel); s.commit()
+                await reply_temp(update, context, f"🗑️ رابطه بین {mention_of(a)} و {mention_of(b)} حذف شد.", parse_mode=ParseMode.HTML); return
+            await reply_temp(update, context, "هیچ رابطه‌ای بین این دو کاربر ثبت نبود."); return
+
+        if (text.strip() in ("حذف رل","حذف رابطه")) and update.message.reply_to_message:
+            if not is_admin:
+                await reply_temp(update, context, "فقط ادمین مجاز است."); return
+            a = upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            await reply_temp(update, context, "برای حذف رل پاسخ بده: «حذف رل @طرف مقابل» یا «حذف رل آیدی»"); return
+
+        # REL start date
+        m = _re_mod.match(r"^شروع\s*رابطه\s+(.+)$", text)
+        if m:
+            date_str = m.group(1).strip()
+            if date_str == "امروز":
+                gdate = dt.datetime.now(TZ_TEHRAN).date()
+            else:
+                try:
+                    gdate = parse_date_from_text(date_str)
+                except Exception:
+                    await reply_temp(update, context, "فرمت تاریخ نامعتبر است. نمونه: «شروع رابطه ۱۴۰۳/۰۵/۲۰»"); return
+            target_user = None
+            if update.message.reply_to_message and is_admin:
+                target_user = upsert_user(s, g.id, update.message.reply_to_message.from_user)
+            else:
+                target_user = me
+            rel = s.query(Relationship).filter_by(chat_id=g.id).filter((Relationship.user_a_id==target_user.id)|(Relationship.user_b_id==target_user.id)).first()
+            if not rel:
+                await reply_temp(update, context, "ابتدا با «رل @A @B» رابطه را ثبت کن."); return
+            rel.started_at = gdate; s.commit()
+            await reply_temp(update, context, f"📅 تاریخ شروع رل: {fmt_date_fa(gdate)}", parse_mode=ParseMode.HTML); return
+
+        # Persian charge
+        if text.startswith("فضول شارژ"):
+            if not is_operator(s, update.effective_user.id):
+                await reply_temp(update, context, "فقط مالک/فروشنده مجاز است."); return
+            toks = text.split()
+            days = None
+            for tok in toks[1:]:
+                t = fa_to_en_digits(tok)
+                if t.isdigit(): days=int(t); break
+            if not days:
+                await reply_temp(update, context, "مثال: «فضول شارژ ۳۰»"); return
+            now = dt.datetime.now(dt.timezone.utc)
+            base = g.expires_at if g.expires_at and g.expires_at > now else now
+            g.expires_at = base + dt.timedelta(days=days); s.commit()
+            await reply_temp(update, context, f"✅ شارژ گروه انجام شد. تاریخ انقضا: {fmt_dt_fa(g.expires_at)}"); return
+    # ==== END TEXT-ONLY COMMANDS ====
+
     # Allow 'انتخاب از لیست' to open chooser
     if text.replace("‌","").strip() in ("انتخاب از لیست","انتخاب از ليست","از لیست","از ليست"):
         with SessionLocal() as s2:
@@ -2112,8 +2295,8 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                     u=s.get(User, r.target_user_id)
                     name=u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
                     lines.append(f"{fa_digits(i)}) {name} — {fa_digits(r.reply_count)} ریپلای")
-                try: await context.bot.send_message(g.id, footer("🌙 محبوب‌های امروز:\n"+"\n".join(lines)))
-                except Exception: ...
+                
+                continue
             males=s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females=s.query(User).filter_by(chat_id=g.id, gender="female").all()
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
@@ -2122,37 +2305,74 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
             if males and females:
                 muser=random.choice(males); fuser=random.choice(females)
                 s.add(ShipHistory(chat_id=g.id, date=today, male_user_id=muser.id, female_user_id=fuser.id)); s.commit()
-                try:
-                    await context.bot.send_message(g.id, footer(f"💘 شیپِ امشب: {(muser.first_name or '@'+(muser.username or ''))} × {(fuser.first_name or '@'+(fuser.username or ''))}"))
-                except Exception: ...
+                
+                continue
 
 async def job_evening(context: ContextTypes.DEFAULT_TYPE):
 
-    # Evening run mirrors midnight routine
 
-    await job_midnight(context)
+    # Ship-only run in the afternoon
+    with SessionLocal() as s:
+        groups = s.query(Group).all()
+        for g in groups:
+            if not group_active(g): 
+                continue
+            try:
+                # prefer opposite genders; else fallback
+                males = s.query(User).filter_by(chat_id=g.id, gender="male").all()
+                females = s.query(User).filter_by(chat_id=g.id, gender="female").all()
+                pair = None
+                if males and females:
+                    a = random.choice(males); b = random.choice(females)
+                    pair = (a,b) if a.id <= b.id else (b,a)
+                else:
+                    users = s.query(User).filter_by(chat_id=g.id).all()
+                    if len(users) >= 2:
+                        a, b = random.sample(users, 2)
+                        pair = (a,b) if a.id <= b.id else (b,a)
+                if pair:
+                    a,b = pair
+                    txt = f"🫶 شیپ امروز: {mention_of(a)} × {mention_of(b)}"
+                    await context.bot.send_message(g.id, footer(txt), parse_mode=ParseMode.HTML)
+            except Exception:
+                ...
+        # (removed) evening mirror removed
+
+    # (removed) await job_midnight(context)
+
 
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
-        groups=s.query(Group).all(); jy,jm,jd=today_jalali()
+        groups = s.query(Group).all()
+        jy, jm, jd = today_jalali()
         for g in groups:
-            if not group_active(g): continue
-            bdays=s.query(User).filter_by(chat_id=g.id).filter(User.birthday.isnot(None)).all()
+            if not group_active(g):
+                continue
+            # 🎂 Birthdays
+            bdays = s.query(User).filter_by(chat_id=g.id).filter(User.birthday.isnot(None)).all()
             for u in bdays:
-                um,ud=to_jalali_md(u.birthday)
-                if um==jm and ud==jd:
-                    try: await context.bot.send_message(g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
-                    except Exception: ...
-            rels=s.query(Relationship).filter_by(chat_id=g.id).all()
+                um, ud = to_jalali_md(u.birthday)
+                if um == jm and ud == jd:
+                    try:
+                        name = u.first_name or ('@'+(u.username or ''))
+                        await context.bot.send_message(g.id, footer(f"🎂 تولد {name} مبارک! ({fmt_date_fa(u.birthday)})"))
+                    except Exception:
+                        ...
+            # 💞 Anniversaries
+            rels = s.query(Relationship).filter_by(chat_id=g.id).all()
             for r in rels:
-                if not r.started_at: continue
+                if not r.started_at:
+                    continue
                 rm, rd = to_jalali_md(r.started_at)
-                if rd==jd:
+                if rd == jd:
                     ua, ub = s.get(User, r.user_a_id), s.get(User, r.user_b_id)
-                    try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
-                    except Exception: ...
-
+                    try:
+                        na = ua.first_name or ('@'+(ua.username or ''))
+                        nb = ub.first_name or ('@'+(ub.username or ''))
+                        await context.bot.send_message(g.id, footer(f"💞 ماهگرد رابطهٔ {na} و {nb} مبارک! ({fmt_date_fa(r.started_at)})"))
+                    except Exception:
+                        ...
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -2182,57 +2402,88 @@ async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
           [InlineKeyboardButton("🛍️ فروشنده‌ها", callback_data="adm:sellers")]]
     await panel_open_initial(update, context, "پنل مالک", rows, root=True); return
 
+
 async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup"):
         await reply_temp(update, context, "این دستور مخصوص داخل گروه است."); return
     with SessionLocal() as s:
         if not is_operator(s, update.effective_user.id):
             await reply_temp(update, context, "فقط مالک/فروشنده مجاز است."); return
-    kb=[[InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{update.effective_chat.id}:30"),
-         InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{update.effective_chat.id}:90"),
-         InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{update.effective_chat.id}:180")]]
-    await panel_open_initial(update, context, "⌁ پنل شارژ گروه", kb, root=True); return
+        g = ensure_group(s, update.effective_chat)
+        raw = clean_text(update.message.text)
+        parts = raw.split()
+        days = None
+        for tok in parts[1:]:
+            t = fa_to_en_digits(tok)
+            if t.isdigit():
+                days = int(t); break
+        if days is None:
+            await reply_temp(update, context, "مثال: «فضول شارژ ۳۰»"); return
+        now = dt.datetime.now(dt.timezone.utc)
+        base = g.expires_at if g.expires_at and g.expires_at > now else now
+        g.expires_at = base + dt.timedelta(days=days)
+        s.commit()
+        await reply_temp(update, context, f"✅ شارژ گروه انجام شد. تاریخ انقضا: {fmt_dt_fa(g.expires_at)}", parse_mode=ParseMode.HTML)
+        return
+
+
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group","supergroup"):
+        await reply_temp(update, context, "این دستور مخصوص داخل گروه است."); return
+    with SessionLocal() as s:
+        g = ensure_group(s, update.effective_chat)
+        me = upsert_user(s, g.id, update.effective_user)
+        is_admin = is_group_admin(s, g.id, update.effective_user.id) or is_operator(s, update.effective_user.id)
+        if not is_admin:
+            await reply_temp(update, context, "این بخش مخصوص ادمین‌ها/مالک/فروشنده است."); return
+        owner = g.owner_user_id and s.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==g.owner_user_id)).scalar_one_or_none()
+        owner_txt = mention_of(owner) if owner else "-"
+        info = (
+            "⚙️ پیکربندی گروه\n"
+            f"عنوان: {g.title or '-'}\n"
+            f"مالک: {owner_txt}\n"
+            f"منطقه‌زمان: {g.timezone or 'Asia/Tehran'}\n"
+            f"انقضا: {fmt_dt_fa(g.expires_at)}\n"
+            "— — —\n"
+            "دستورات پیکربندی (ادمین/مالک/فروشنده):\n"
+            "• تنظیم مالک @یوزرنیم | آیدی عددی\n"
+            "• تنظیم منطقه‌زمان Asia/Tehran\n"
+            "• فضول شارژ ۳۰  ← افزودن ۳۰ روز به انقضای گروه\n"
+            "• فروشنده‌ها ← نمایش\n"
+            "• افزودن فروشنده @یوزرنیم | آیدی عددی | (ریپلای)\n"
+            "• حذف فروشنده @یوزرنیم | آیدی عددی | (ریپلای)\n"
+        )
+        await reply_temp(update, context, info, parse_mode=ParseMode.HTML, keep=True)
+        return
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_temp(update, context, user_help_text(), keep=True)
-
-def main():
-
-    if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
-    acquire_singleton_or_exit()
-
-    app = Application.builder().token(TOKEN).post_init(_post_init).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("panel", cmd_panel))
-    app.add_handler(CommandHandler("charge", cmd_charge))
-    app.add_handler(CommandHandler("help", cmd_help))
-
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_error_handler(error_handler)
-
-    app.add_handler(MessageHandler(filters.ALL, on_any), group=100)
-
-    # Jobs
-    jq = app.job_queue
-    if jq:
-        jq.run_daily(job_morning, time=dt.time(6,0,0,tzinfo=TZ_TEHRAN))
-        jq.run_daily(job_midnight, time=dt.time(0,1,0,tzinfo=TZ_TEHRAN))
-        jq.run_repeating(singleton_watchdog, interval=60, first=60)
-
-    # Start polling
-    logging.info("FazolBot running in POLLING mode…")
-    allowed = ["message","edited_message","callback_query","my_chat_member","chat_member","chat_join_request"]
-    app.run_polling(allowed_updates=allowed, drop_pending_updates=True)
-
-
-
-
+    txt = (
+        "📖 راهنما\n"
+        "— — —\n"
+        "دستورات عمومی:\n"
+        "• پروفایل ← نمایش اطلاعات شما\n"
+        "• محبوب امروز ← بر اساس ریپلای‌های امروز\n"
+        "• شیپم کن ← پیشنهاد پارتنر تصادفی\n"
+        "• شروع رابطه ۱۴۰۳/۰۵/۲۰ ← ثبت تاریخ شروع رابطه برای خودتان (اگر رل دارید)\n"
+        "— — —\n"
+        "دستورات ادمین:\n"
+        "• رل @A @B  ← ثبت رابطه بین دو نفر (فقط ادمین)\n"
+        "• (ریپلای به A) رل @B  ← ثبت رابطه A با B (فقط ادمین)\n"
+        "• حذف رل @A @B  ← حذف رابطه ثبت‌شده (فقط ادمین)\n"
+        "• (ریپلای) حذف رل @دیگری  ← حذف رل با کاربر پاسخ‌داده‌شده (فقط ادمین)\n"
+        "• شروع رابطه ۱۴۰۳/۰۵/۲۰  ← با ریپلای روی کاربر، تاریخ رل او را تنظیم کن (فقط ادمین)\n"
+        "— — —\n"
+        "دستورات مالک/فروشنده [مخصوص مالک/فروشنده]:\n"
+        "• پیکربندی  ← نمایش تنظیمات گروه\n"
+        "• فضول شارژ ۳۰  ← افزایش اعتبار گروه به‌مدت ۳۰ روز\n"
+        "• فروشنده‌ها  ← لیست فروشنده‌های فعال\n"
+        "• افزودن فروشنده @یوزرنیم | آیدی عددی | (ریپلای)\n"
+        "• حذف فروشنده @یوزرنیم | آیدی عددی | (ریپلای)\n"
+        "• گروه‌ها  ← لیست گروه‌ها به‌همراه لینک ورود\n"
+        "— — —\n"
+        "نکته: هیچ منویی وجود ندارد؛ همه‌چیز با متن انجام می‌شود."
+    )
+    await reply_temp(update, context, txt, keep=True)
 
 async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
@@ -2453,7 +2704,28 @@ async def cb_rel_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(q.message.edit_text, f"✅ رابطه ثبت شد: {fa_digits(str(jd))}")
         REL_DATE_WAIT.pop((chat.id, user_id), None)
         return
-    
+
+
+def main():
+    if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
+    acquire_singleton_or_exit()
+
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
+
+    # Handlers (text-only)
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Jobs
+    jq = app.job_queue
+    jq.run_daily(job_morning,  time=dt.time(9, 0, 0, tzinfo=TZ_TEHRAN))
+    # (disabled) jq.run_daily(job_midnight, time=dt.time(0, 1, 0, tzinfo=TZ_TEHRAN))  # disabled by request
+    # Optional: also run a pre-night summary at 20:00 Tehran
+    jq.run_daily(job_evening,  time=dt.time(17, 0, 0, tzinfo=TZ_TEHRAN))
+
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
