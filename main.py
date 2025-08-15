@@ -502,12 +502,12 @@ def upsert_user(session, chat_id: int, tg_user) -> "User":
     u.first_name = tg_user.first_name or u.first_name
     u.last_name = tg_user.last_name or u.last_name
     u.username = tg_user.username or u.username
-    u.last_seen = dt.datetime.utcnow()
+    u.last_seen = dt.datetime.now(dt.timezone.utc)
     session.flush(); return u
 
 def group_active(g: "Group") -> bool:
     if g.expires_at is None: return True
-    return g.expires_at > dt.datetime.utcnow()
+    return g.expires_at > dt.datetime.now(dt.timezone.utc)
 
 def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[List[InlineKeyboardButton]]:
     rows: List[List[InlineKeyboardButton]] = [
@@ -556,7 +556,7 @@ def _panel_pop(msg):
 def _set_rel_wait(chat_id: int, actor_tg: int, target_user_id: int, target_tgid: int | None = None):
     ctx={"target_user_id": target_user_id};
     if target_tgid: ctx["target_tgid"]=target_tgid
-    ctx["ts"] = dt.datetime.utcnow().timestamp()
+    ctx["ts"] = dt.datetime.now(dt.timezone.utc).timestamp()
     REL_WAIT[(chat_id, actor_tg)] = ctx
 def _pop_rel_wait(chat_id: int, actor_tg: int):
     return REL_WAIT.pop((chat_id, actor_tg), None)
@@ -915,7 +915,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
 
     if data=="rel:ask":
-        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=False); return
 
     # --- Relationship date wizard ---
@@ -990,7 +990,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not g:
                 await panel_edit(context, msg, user_id, "گروه پیدا نشد.",
                                  [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
-            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
+            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.now(dt.timezone.utc) else dt.datetime.now(dt.timezone.utc)
             g.expires_at = base + dt.timedelta(days=days)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="extend", amount_days=days))
             s.commit()
@@ -1072,7 +1072,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await panel_edit(context, msg, user_id, "فقط مالک/فروشنده.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
                 g=s.get(Group, gid)
                 if not g: await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
-                g.expires_at = dt.datetime.utcnow(); s.commit()
+                g.expires_at = dt.datetime.now(dt.timezone.utc); s.commit()
             await notify_owner(context, f"[گزارش] انقضای گروه {gid} صفر شد.")
             await panel_edit(context, msg, user_id, "⏱ صفر شد.", [[InlineKeyboardButton("بازگشت", callback_data=f"adm:g:{gid}")]], root=True); return
 
@@ -1294,7 +1294,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
 
     if data=="rel:ask":
-        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=False); return
 
     # --- Relationship date wizard ---
@@ -1369,7 +1369,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not g:
                 await panel_edit(context, msg, user_id, "گروه پیدا نشد.",
                                  [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
-            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
+            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.now(dt.timezone.utc) else dt.datetime.now(dt.timezone.utc)
             g.expires_at = base + dt.timedelta(days=days)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="extend", amount_days=days))
             s.commit()
@@ -1451,7 +1451,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await panel_edit(context, msg, user_id, "فقط مالک/فروشنده.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
                 g=s.get(Group, gid)
                 if not g: await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
-                g.expires_at = dt.datetime.utcnow(); s.commit()
+                g.expires_at = dt.datetime.now(dt.timezone.utc); s.commit()
             await notify_owner(context, f"[گزارش] انقضای گروه {gid} صفر شد.")
             await panel_edit(context, msg, user_id, "⏱ صفر شد.", [[InlineKeyboardButton("بازگشت", callback_data=f"adm:g:{gid}")]], root=True); return
 
@@ -1740,7 +1740,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav: btns.append(nav)
         btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
         msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
-        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         return
 
     # EARLY: waiting for username/id from "rel:ask"
@@ -1794,7 +1794,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    if RE_WORD_FAZOL.search(text):
+    if text.strip() == "فضول":
         if "منو" in text or "فهرست" in text:
             with SessionLocal() as s:
                 g=ensure_group(s, update.effective_chat)
@@ -1907,7 +1907,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask"), InlineKeyboardButton("انصراف", callback_data="nav:close")])
                 msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
                 # Put user in waiting mode so further @/id text works too
-                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
                 return
 
     # شروع رابطه (با تاریخ یا بدون تاریخ)
@@ -1978,7 +1978,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target = upsert_user(s, g.id, update.message.reply_to_message.from_user)
             else:
                 target = me
-        BD_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"target_user_id": target.id, "ts": dt.datetime.utcnow().timestamp()}
+        BD_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"target_user_id": target.id, "ts": dt.datetime.now(dt.timezone.utc).timestamp()}
         y = jalali_now_year(); years = list(range(y, y-90, -1)); rows=[]
         for ch in chunked(years,4):
             rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"bd:y:{yy}") for yy in ch])
@@ -2737,7 +2737,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         txt = update.message.text
         chat_type = getattr(update.effective_chat, "type", None)
-        logging.info(f"[on_text] chat_type={chat_type} user={update.effective_user.id if update.effective_user else None} text={txt[:64]!r}")
+        # logging.info(f"[on_text] chat_type={chat_type} user={update.effective_user.id if update.effective_user else None} text={txt[:64]!r}")
         # Avoid catching slash commands; let CommandHandlers take them
         if txt.startswith('/'):
             return
