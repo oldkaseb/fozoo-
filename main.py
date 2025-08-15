@@ -50,6 +50,121 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
+
+# --- Async & Send helpers (patch) ---
+import asyncio
+import re as _re_patch
+from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
+
+async def db_to_thread(fn, *a, **kw):
+    return await asyncio.to_thread(lambda: fn(*a, **kw))
+
+async def safe_send(callable_func, *a, **kw):
+    try:
+        return await callable_func(*a, **kw)
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, "retry_after", 1) + 1)
+        return await callable_func(*a, **kw)
+    except (TimedOut, NetworkError):
+        await asyncio.sleep(2)
+        return await callable_func(*a, **kw)
+    except BadRequest:
+        return None
+
+async def send_chunked(tasks):
+    for i in range(0, len(tasks), 8):
+        chunk = tasks[i:i+8]
+        await asyncio.gather(*chunk)
+        await asyncio.sleep(0.6)
+
+# --- Name/Mention helpers (patch) ---
+import unicodedata as _unicodedata_patch
+
+def normalize_username(s: str) -> str:
+    if not s: return ""
+    s = s.strip().replace("‌","").replace("\u200c","")
+    if s.startswith("@"): s = s[1:]
+    return s.lower()
+
+def display_name(u) -> str:
+    try:
+        return (u.first_name or u.username or "کاربر")
+    except Exception:
+        return "کاربر"
+
+def mention_html_for(tg_user_id: int, name: str) -> str:
+    safe = _re_patch.sub(r"[<>]", "", name or "کاربر")
+    return f'<a href="tg://user?id={tg_user_id}">{safe}</a>'
+
+def label_user(u) -> str:
+    name = display_name(u)
+    return mention_html_for(getattr(u, "tg_user_id", getattr(u, "user_id", 0)), name)
+
+def label_chat_title(chat) -> str:
+    try:
+        return chat.title or "گروه"
+    except Exception:
+        return "گروه"
+
+# --- Robust resolver for group users (patch) ---
+from sqlalchemy import select as _select_patch, func as _func_patch
+async def resolve_group_user(update, context, session, group_db_id: int, text_query: str):
+    msg = update.effective_message
+    # reply
+    if msg and getattr(msg, "reply_to_message", None) and msg.reply_to_message.from_user:
+        r = msg.reply_to_message.from_user
+        tgt = session.execute(
+            _select_patch(User).where(User.chat_id==group_db_id, User.tg_user_id==r.id)
+        ).scalar_one_or_none()
+        if tgt:
+            return tgt, "reply"
+    # entities with attached user
+    try:
+        if msg and getattr(msg, "entities", None):
+            for ent in msg.entities:
+                uo = getattr(ent, "user", None)
+                if uo:
+                    tgt = session.execute(
+                        _select_patch(User).where(User.chat_id==group_db_id, User.tg_user_id==uo.id)
+                    ).scalar_one_or_none()
+                    if tgt:
+                        return tgt, "entity"
+    except Exception:
+        pass
+    q = (text_query or "").strip()
+    uname = normalize_username(q)
+    if uname:
+        tgt = session.execute(
+            _select_patch(User).where(
+                User.chat_id==group_db_id,
+                _func_patch.lower(_func_patch.coalesce(User.username, ""))==uname
+            )
+        ).scalar_one_or_none()
+        if tgt:
+            return tgt, "username"
+    if q.isdigit():
+        try:
+            tid = int(q)
+            tgt = session.execute(
+                _select_patch(User).where(User.chat_id==group_db_id, User.tg_user_id==tid)
+            ).scalar_one_or_none()
+            if tgt:
+                return tgt, "id"
+        except Exception:
+            pass
+    clean = normalize_username(_unicodedata_patch.normalize("NFKC", q)).replace("_", " ")
+    if clean:
+        like = f"%{clean}%"
+        tgt = session.execute(
+            _select_patch(User).where(
+                User.chat_id==group_db_id,
+                _func_patch.replace(_func_patch.lower(_func_patch.coalesce(User.first_name, "")),"‌","").ilike(like)
+            ).order_by(User.id.asc())
+        ).scalar_one_or_none()
+        if tgt:
+            return tgt, "name"
+    return None, "not_found"
+
     Application, MessageHandler, CallbackQueryHandler, ChatMemberHandler,
     CommandHandler, filters, ContextTypes
 )
@@ -385,12 +500,12 @@ def upsert_user(session, chat_id: int, tg_user) -> "User":
     u.first_name = tg_user.first_name or u.first_name
     u.last_name = tg_user.last_name or u.last_name
     u.username = tg_user.username or u.username
-    u.last_seen = dt.datetime.utcnow()
+    u.last_seen = dt.datetime.now(dt.timezone.utc)
     session.flush(); return u
 
 def group_active(g: "Group") -> bool:
     if g.expires_at is None: return True
-    return g.expires_at > dt.datetime.utcnow()
+    return g.expires_at > dt.datetime.now(dt.timezone.utc)
 
 def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[List[InlineKeyboardButton]]:
     rows: List[List[InlineKeyboardButton]] = [
@@ -438,7 +553,7 @@ def _panel_pop(msg):
 def _set_rel_wait(chat_id: int, actor_tg: int, target_user_id: int, target_tgid: int | None = None):
     ctx={"target_user_id": target_user_id};
     if target_tgid: ctx["target_tgid"]=target_tgid
-    ctx["ts"] = dt.datetime.utcnow().timestamp()
+    ctx["ts"] = dt.datetime.now(dt.timezone.utc).timestamp()
     REL_WAIT[(chat_id, actor_tg)] = ctx
 def _pop_rel_wait(chat_id: int, actor_tg: int):
     return REL_WAIT.pop((chat_id, actor_tg), None)
@@ -597,7 +712,7 @@ async def notify_owner(context, text: str):
         if url:
             from telegram import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("ورود به گروه", url=url)]])
-        await context.bot.send_message(OWNER_ID, text_html, disable_web_page_preview=False, parse_mode="HTML", reply_markup=kb)
+        await safe_send(context.bot.send_message, OWNER_ID, text_html, disable_web_page_preview=False, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logging.warning(f"notify_owner failed: {e}")
 
@@ -718,7 +833,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
 
     if data=="rel:ask":
-        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=False); return
 
     # --- Relationship date wizard ---
@@ -793,7 +908,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not g:
                 await panel_edit(context, msg, user_id, "گروه پیدا نشد.",
                                  [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
-            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
+            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.now(dt.timezone.utc) else dt.datetime.now(dt.timezone.utc)
             g.expires_at = base + dt.timedelta(days=days)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="extend", amount_days=days))
             s.commit()
@@ -875,7 +990,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await panel_edit(context, msg, user_id, "فقط مالک/فروشنده.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
                 g=s.get(Group, gid)
                 if not g: await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
-                g.expires_at = dt.datetime.utcnow(); s.commit()
+                g.expires_at = dt.datetime.now(dt.timezone.utc); s.commit()
             await notify_owner(context, f"[گزارش] انقضای گروه {gid} صفر شد.")
             await panel_edit(context, msg, user_id, "⏱ صفر شد.", [[InlineKeyboardButton("بازگشت", callback_data=f"adm:g:{gid}")]], root=True); return
 
@@ -963,7 +1078,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav: btns.append(nav)
         btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
         msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
-        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         return
 
     # EARLY: waiting for username/id from "rel:ask"
@@ -1127,7 +1242,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask"), InlineKeyboardButton("انصراف", callback_data="nav:close")])
                 msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
                 # Put user in waiting mode so further @/id text works too
-                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
                 return
 
     # birthday set# birthday set
@@ -1241,15 +1356,12 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_user=upsert_user(s2, g.id, update.message.reply_to_message.from_user)
             elif selector in ("داده های من","داده‌های من","me","خودم","خود",""):
                 target_user=me
-            elif selector.startswith("@"):
-                uname=selector[1:].lower()
-                target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
-            else:
-                try:
-                    tgid=int(selector)
-                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
-                except Exception: target_user=None
+            
+            # robust resolve via reply/mention/@/id/name
+            target_user, how = await resolve_group_user(update, context, s2, g.id, selector or "")
             if not target_user:
+                await reply_temp(update, context, "کاربر پیدا نشد. ریپلای کن یا «آیدی داده‌های من» یا @/آیدی/اسم بده."); return
+
                 await reply_temp(update, context, "کاربر پیدا نشد. ریپلای کن یا «آیدی داده های من» یا @/آیدی بده."); return
             if target_user.tg_user_id != me.tg_user_id:
                 if not (is_group_admin(s2, g.id, me.tg_user_id) or is_operator(s2, me.tg_user_id)):
@@ -1259,7 +1371,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
             if photos.total_count>0:
                 file_id = photos.photos[0][-1].file_id
-                await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+                await safe_send(context.bot.send_photo, update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
             else:
                 await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
         except Exception:
@@ -1435,7 +1547,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(err, TgConflict):
         try:
             if OWNER_ID:
-                await context.bot.send_message(OWNER_ID, "⚠️ Conflict 409: نمونهٔ دیگری از ربات در حال polling است. این نمونه خارج شد.")
+                await safe_send(context.bot.send_message, OWNER_ID, "⚠️ Conflict 409: نمونهٔ دیگری از ربات در حال polling است. این نمونه خارج شد.")
         except Exception: ...
         logging.error("Conflict 409 detected. Exiting."); os._exit(0)
     logging.exception("Unhandled error", exc_info=err)
@@ -1460,7 +1572,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                     u=s.get(User, r.target_user_id)
                     name=u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
                     lines.append(f"{fa_digits(i)}) {name} — {fa_digits(r.reply_count)} ریپلای")
-                try: await context.bot.send_message(g.id, footer("🌙 محبوب‌های امروز:\n"+"\n".join(lines)))
+                try: await safe_send(context.bot.send_message, g.id, footer("🌙 محبوب‌های امروز:\n"+"\n".join(lines)))
                 except Exception: ...
             males=s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females=s.query(User).filter_by(chat_id=g.id, gender="female").all()
@@ -1471,7 +1583,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                 muser=random.choice(males); fuser=random.choice(females)
                 s.add(ShipHistory(chat_id=g.id, date=today, male_user_id=muser.id, female_user_id=fuser.id)); s.commit()
                 try:
-                    await context.bot.send_message(g.id, footer(f"💘 شیپِ امشب: {(muser.first_name or '@'+(muser.username or ''))} × {(fuser.first_name or '@'+(fuser.username or ''))}"))
+                    await safe_send(context.bot.send_message, g.id, footer(f"💘 شیپِ امشب: {(muser.first_name or '@'+(muser.username or ''))} × {(fuser.first_name or '@'+(fuser.username or ''))}"))
                 except Exception: ...
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
@@ -1483,7 +1595,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             for u in bdays:
                 um,ud=to_jalali_md(u.birthday)
                 if um==jm and ud==jd:
-                    try: await context.bot.send_message(g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
+                    try: await safe_send(context.bot.send_message, g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
                     except Exception: ...
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
             for r in rels:
@@ -1491,7 +1603,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                 rm, rd = to_jalali_md(r.started_at)
                 if rd==jd:
                     ua, ub = s.get(User, r.user_a_id), s.get(User, r.user_b_id)
-                    try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
+                    try: await safe_send(context.bot.send_message, g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
 async def _post_init(app: Application):
@@ -1926,12 +2038,12 @@ def upsert_user(session, chat_id: int, tg_user) -> "User":
     u.first_name = tg_user.first_name or u.first_name
     u.last_name = tg_user.last_name or u.last_name
     u.username = tg_user.username or u.username
-    u.last_seen = dt.datetime.utcnow()
+    u.last_seen = dt.datetime.now(dt.timezone.utc)
     session.flush(); return u
 
 def group_active(g: "Group") -> bool:
     if g.expires_at is None: return True
-    return g.expires_at > dt.datetime.utcnow()
+    return g.expires_at > dt.datetime.now(dt.timezone.utc)
 
 def kb_group_menu(is_group_admin_flag: bool, is_operator_flag: bool) -> List[List[InlineKeyboardButton]]:
     rows: List[List[InlineKeyboardButton]] = [
@@ -1979,7 +2091,7 @@ def _panel_pop(msg):
 def _set_rel_wait(chat_id: int, actor_tg: int, target_user_id: int, target_tgid: int | None = None):
     ctx={"target_user_id": target_user_id};
     if target_tgid: ctx["target_tgid"]=target_tgid
-    ctx["ts"] = dt.datetime.utcnow().timestamp()
+    ctx["ts"] = dt.datetime.now(dt.timezone.utc).timestamp()
     REL_WAIT[(chat_id, actor_tg)] = ctx
 def _pop_rel_wait(chat_id: int, actor_tg: int):
     return REL_WAIT.pop((chat_id, actor_tg), None)
@@ -2138,7 +2250,7 @@ async def notify_owner(context, text: str):
         if url:
             from telegram import InlineKeyboardMarkup, InlineKeyboardButton
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("ورود به گروه", url=url)]])
-        await context.bot.send_message(OWNER_ID, text_html, disable_web_page_preview=False, parse_mode="HTML", reply_markup=kb)
+        await safe_send(context.bot.send_message, OWNER_ID, text_html, disable_web_page_preview=False, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logging.warning(f"notify_owner failed: {e}")
 
@@ -2259,7 +2371,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
 
     if data=="rel:ask":
-        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("انصراف", callback_data="nav:close")]], root=False); return
 
     # --- Relationship date wizard ---
@@ -2334,7 +2446,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not g:
                 await panel_edit(context, msg, user_id, "گروه پیدا نشد.",
                                  [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
-            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.utcnow() else dt.datetime.utcnow()
+            base = g.expires_at if g.expires_at and g.expires_at > dt.datetime.now(dt.timezone.utc) else dt.datetime.now(dt.timezone.utc)
             g.expires_at = base + dt.timedelta(days=days)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user_id, action="extend", amount_days=days))
             s.commit()
@@ -2416,7 +2528,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await panel_edit(context, msg, user_id, "فقط مالک/فروشنده.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
                 g=s.get(Group, gid)
                 if not g: await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
-                g.expires_at = dt.datetime.utcnow(); s.commit()
+                g.expires_at = dt.datetime.now(dt.timezone.utc); s.commit()
             await notify_owner(context, f"[گزارش] انقضای گروه {gid} صفر شد.")
             await panel_edit(context, msg, user_id, "⏱ صفر شد.", [[InlineKeyboardButton("بازگشت", callback_data=f"adm:g:{gid}")]], root=True); return
 
@@ -2504,7 +2616,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav: btns.append(nav)
         btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
         msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
-        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
         return
 
     # EARLY: waiting for username/id from "rel:ask"
@@ -2652,7 +2764,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not target_user:
                 rows=[[InlineKeyboardButton("انصراف", callback_data="nav:close")]]
                 msg = await panel_open_initial(update, context, "ثبت رابطه — @یوزرنیم یا آیدی عددی طرف مقابل را بفرست", rows, root=True)
-                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+                REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.now(dt.timezone.utc).timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
                 return
     # birthday set# birthday set
     m=re.match(r"^ثبت تولد ([\d\/\-]+)$", text)
@@ -2783,7 +2895,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
             if photos.total_count>0:
                 file_id = photos.photos[0][-1].file_id
-                await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+                await safe_send(context.bot.send_photo, update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
             else:
                 await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
         except Exception:
@@ -2959,7 +3071,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(err, TgConflict):
         try:
             if OWNER_ID:
-                await context.bot.send_message(OWNER_ID, "⚠️ Conflict 409: نمونهٔ دیگری از ربات در حال polling است. این نمونه خارج شد.")
+                await safe_send(context.bot.send_message, OWNER_ID, "⚠️ Conflict 409: نمونهٔ دیگری از ربات در حال polling است. این نمونه خارج شد.")
         except Exception: ...
         logging.error("Conflict 409 detected. Exiting."); os._exit(0)
     logging.exception("Unhandled error", exc_info=err)
@@ -2984,7 +3096,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                     u=s.get(User, r.target_user_id)
                     name=u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
                     lines.append(f"{fa_digits(i)}) {name} — {fa_digits(r.reply_count)} ریپلای")
-                try: await context.bot.send_message(g.id, footer("🌙 محبوب‌های امروز:\n"+"\n".join(lines)))
+                try: await safe_send(context.bot.send_message, g.id, footer("🌙 محبوب‌های امروز:\n"+"\n".join(lines)))
                 except Exception: ...
             males=s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females=s.query(User).filter_by(chat_id=g.id, gender="female").all()
@@ -2995,7 +3107,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
                 muser=random.choice(males); fuser=random.choice(females)
                 s.add(ShipHistory(chat_id=g.id, date=today, male_user_id=muser.id, female_user_id=fuser.id)); s.commit()
                 try:
-                    await context.bot.send_message(g.id, footer(f"💘 شیپِ امشب: {(muser.first_name or '@'+(muser.username or ''))} × {(fuser.first_name or '@'+(fuser.username or ''))}"))
+                    await safe_send(context.bot.send_message, g.id, footer(f"💘 شیپِ امشب: {(muser.first_name or '@'+(muser.username or ''))} × {(fuser.first_name or '@'+(fuser.username or ''))}"))
                 except Exception: ...
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
@@ -3007,7 +3119,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             for u in bdays:
                 um,ud=to_jalali_md(u.birthday)
                 if um==jm and ud==jd:
-                    try: await context.bot.send_message(g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
+                    try: await safe_send(context.bot.send_message, g.id, footer(f"🎉🎂 تولدت مبارک {(u.first_name or '@'+(u.username or ''))}! ({fmt_date_fa(u.birthday)})"))
                     except Exception: ...
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
             for r in rels:
@@ -3015,7 +3127,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                 rm, rd = to_jalali_md(r.started_at)
                 if rd==jd:
                     ua, ub = s.get(User, r.user_a_id), s.get(User, r.user_b_id)
-                    try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
+                    try: await safe_send(context.bot.send_message, g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
 async def _post_init(app: Application):
