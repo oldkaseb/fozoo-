@@ -535,6 +535,63 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{chat_id}:180")]]
         await panel_edit(context, msg, user_id, "⌁ پنل شارژ گروه", kb, root=False); return
 
+    # --- Relationship wizard callbacks ---
+    m=re.match(r"^rel:yp:(\d+)$", data)
+    if m:
+        start=int(m.group(1))
+        years=list(range(start, start-16, -1))
+        rows=[[InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in years[i:i+4]] for i in range(0,len(years),4)]
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{start-16}")])
+        await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^rel:y:(\d{4})$", data)
+    if m:
+        y=int(m.group(1))
+        months=list(range(1,13))
+        rows=[[InlineKeyboardButton(fa_digits(str(mm)), callback_data=f"rel:m:{y}-{mm}") for mm in months[i:i+4]] for i in range(0,12,4)]
+        await panel_edit(context, msg, user_id, f"سال {fa_digits(y)} — ماه را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^rel:m:(\d{4})-(\d{1,2})$", data)
+    if m:
+        y=int(m.group(1)); mth=int(m.group(2))
+        try:
+            mdays=jalali_month_len(y, mth)
+        except Exception:
+            mdays=31 if mth<=6 else (30 if mth<=11 else 29)
+        days=list(range(1, mdays+1))
+        rows=[[InlineKeyboardButton(fa_digits(str(dd)), callback_data=f"rel:d:{y}-{mth}-{dd}") for dd in days[i:i+7]] for i in range(0,len(days),7)]
+        await panel_edit(context, msg, user_id, f"{fa_digits(y)}/{fa_digits(mth)} — روز را انتخاب کن", rows, root=False); return
+
+    m=re.match(r"^rel:d:(\d{4})-(\d{1,2})-(\d{1,2})$", data)
+    if m:
+        y=int(m.group(1)); mth=int(m.group(2)); dd=int(m.group(3))
+        ctx=_pop_rel_wait(chat_id, user_id)
+        if not ctx:
+            await panel_edit(context, msg, user_id, "جلسه پیدا نشد. دوباره «ثبت رابطه» را بزن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+        target_user_id = ctx.get("target_user_id")
+        with SessionLocal() as s:
+            me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
+            other = s.get(User, target_user_id) if target_user_id else None
+            if not (me and other):
+                await panel_edit(context, msg, user_id, "کاربرها پیدا نشدند. دوباره امتحان کن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+            try:
+                if HAS_PTOOLS:
+                    from persiantools.jdatetime import JalaliDate
+                    gdate=JalaliDate(y,mth,dd).to_gregorian()
+                else:
+                    gdate=dt.date(y, mth, dd)
+            except Exception:
+                await panel_edit(context, msg, user_id, "تاریخ نامعتبر بود.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+            s.execute(Relationship.__table__.delete().where((Relationship.chat_id==chat_id) & ((Relationship.user_a_id==me.id) | (Relationship.user_b_id==me.id) | (Relationship.user_a_id==other.id) | (Relationship.user_b_id==other.id))))
+            ua, ub = (me.id, other.id) if me.id < other.id else (other.id, me.id)
+            s.add(Relationship(chat_id=chat_id, user_a_id=ua, user_b_id=ub, started_at=gdate))
+            s.commit()
+        await panel_edit(context, msg, user_id, f"✅ رابطه ثبت شد از {fmt_date_fa(gdate)}", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
+        try:
+            await notify_owner(context, f"[گزارش] رابطه در گروه {chat_id} ثبت شد: {user_id} با {other.tg_user_id} از {fmt_date_fa(gdate)}")
+        except Exception: ...
+        return
+
     m=re.match(r"^chg:(-?\d+):(\d+)$", data)
     if m:
         target_chat=int(m.group(1)); days=int(m.group(2))
@@ -738,6 +795,25 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{update.effective_chat.id}:90"),
              InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{update.effective_chat.id}:180")]]
         await panel_open_initial(update, context, "⌁ پنل شارژ گروه", kb, root=True)
+        return
+
+
+    # owner quick panel for THIS group
+    if text == "پنل اینجا":
+        with SessionLocal() as s:
+            if not (update.effective_user.id==OWNER_ID or is_seller(s, update.effective_user.id)):
+                return
+            g=ensure_group(s, update.effective_chat)
+            ex=fmt_dt_fa(g.expires_at); title=g.title or "-"
+        rows=[
+            [InlineKeyboardButton("➕ ۳۰", callback_data=f"chg:{g.id}:30"),
+             InlineKeyboardButton("➕ ۹۰", callback_data=f"chg:{g.id}:90"),
+             InlineKeyboardButton("➕ ۱۸۰", callback_data=f"chg:{g.id}:180")],
+            [InlineKeyboardButton("⏱ صفر کردن", callback_data=f"adm:zero:{g.id}")],
+            [InlineKeyboardButton("🚪 خروج از گروه", callback_data=f"adm:leave:{g.id}")],
+            [InlineKeyboardButton("🧹 پاکسازی داده‌ها", callback_data=f"wipe:{g.id}")],
+        ]
+        await panel_open_initial(update, context, f"مدیریت گروه\n{title}\nID: {g.id}\nانقضا: {ex}", rows, root=True)
         return
 
     # gender
@@ -981,6 +1057,12 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # owner/seller panel
 
+        # quick list of groups in PV
+        if text in ("لیست گروه ها","لیست گروه‌ها"):
+            rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")]]
+            await panel_open_initial(update, context, "📋 لیست گروه‌ها", rows, root=True); return
+
+
         # quick open owner panel by text
         if text in ("پنل مالک","پنل","مدیریت"):
             rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
@@ -1030,6 +1112,23 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "• «فضول منو» → منوی دکمه‌ای\n"
              "• «فضول کمک» → راهنما")
         await reply_temp(update, context, txt); return
+    # private: owner panel or user intro
+    uid = update.effective_user.id
+    with SessionLocal() as s:
+        seller = is_seller(s, uid)
+    if uid!=OWNER_ID and not seller:
+        txt=("سلام! 👋 من «فضول»م، ربات اجتماعی گروه‌های فارسی.\n"
+             "• منو و امکانات داخل گروه فعال می‌شن.\n"
+             "• برای شروع، منو رو با «فضول منو» باز کن.")
+        rows=[[InlineKeyboardButton("➕ افزودن به گروه", url=f"https://t.me/{bot_username}?startgroup=true")],
+              [InlineKeyboardButton("📨 تماس با مالک", url=f"https://t.me/{OWNER_CONTACT_USERNAME}")]]
+        await reply_temp(update, context, txt, reply_markup=InlineKeyboardMarkup(rows), keep=True); return
+    rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
+          [InlineKeyboardButton("🛍️ فروشنده‌ها", callback_data="adm:sellers")],
+          [InlineKeyboardButton("➕ افزودن به گروه", url=f"https://t.me/{bot_username}?startgroup=true")],
+          [InlineKeyboardButton("📨 تماس با مالک", url=f"https://t.me/{OWNER_CONTACT_USERNAME}")]]
+    who = "👑 پنل مالک" if uid==OWNER_ID else "🛍️ پنل فروشنده"
+    await panel_open_initial(update, context, who, rows, root=True); return
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err=context.error
@@ -1095,6 +1194,41 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_username=context.bot.username
+    if update.effective_chat.type in ("group","supergroup"):
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            is_gadmin = is_group_admin(s, g.id, update.effective_user.id)
+            oper = is_operator(s, update.effective_user.id)
+        title="🕹 منوی فضول"
+        rows=kb_group_menu(is_gadmin, oper)
+        await panel_open_initial(update, context, title, rows, root=True); return
+    await on_start(update, context)
+
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid=update.effective_user.id
+    with SessionLocal() as s:
+        if not (uid==OWNER_ID or is_seller(s, uid)):
+            await reply_temp(update, context, "این دستور مخصوص مالک/فروشنده است."); return
+    rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
+          [InlineKeyboardButton("🛍️ فروشنده‌ها", callback_data="adm:sellers")]]
+    await panel_open_initial(update, context, "پنل مالک", rows, root=True); return
+
+async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group","supergroup"):
+        await reply_temp(update, context, "این دستور مخصوص داخل گروه است."); return
+    with SessionLocal() as s:
+        if not is_operator(s, update.effective_user.id):
+            await reply_temp(update, context, "فقط مالک/فروشنده مجاز است."); return
+    kb=[[InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{update.effective_chat.id}:30"),
+         InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{update.effective_chat.id}:90"),
+         InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{update.effective_chat.id}:180")]]
+    await panel_open_initial(update, context, "⌁ پنل شارژ گروه", kb, root=True); return
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reply_temp(update, context, user_help_text(), keep=True)
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -1110,6 +1244,10 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("charge", cmd_charge))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
