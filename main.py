@@ -2088,3 +2088,14 @@ async def send_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(update.effective_chat.send_message, "من اینجام 😉")
 
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback, logging
+        logging.exception("Fatal error in main: %s", e)
+        raise
