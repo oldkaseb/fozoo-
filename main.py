@@ -118,7 +118,6 @@ if not INSTANCE_TAG:
     INSTANCE_TAG = hashlib.blake2b(f"{os.getenv('RAILWAY_SERVICE_NAME','')}-{os.getpid()}".encode(), digest_size=4).hexdigest()
 
 DEFAULT_TZ = "Asia/Tehran"
-SKIP_PROFILE_PHOTO = os.getenv("SKIP_PROFILE_PHOTO", "1").strip().lower() in ("1","true","yes")
 TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
 
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
@@ -343,12 +342,7 @@ with engine.begin() as conn:
         CREATE UNIQUE INDEX IF NOT EXISTS ix_users_chat_tg ON users (chat_id, tg_user_id);
         CREATE INDEX IF NOT EXISTS ix_ship_chat_date ON ship_history (chat_id, date);
         CREATE UNIQUE INDEX IF NOT EXISTS ix_ga_unique ON group_admins (chat_id, tg_user_id);
-    """
-with engine.begin() as conn:
-    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_chat_last_seen ON users (chat_id, last_seen)"))
-with engine.begin() as conn:
-    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_chat_gender ON users (chat_id, gender)"))
-))
+    """))
 # --- Self-healing for collation mismatch (safe to run; skips if not needed) ---
 def _db_self_heal_collation(engine):
     try:
@@ -585,69 +579,58 @@ def _advisory_key() -> int:
 def _acquire_lock(conn, key: int) -> bool:
     cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)", (key,)); ok=cur.fetchone()[0]; return bool(ok)
 
+
 def acquire_singleton_or_exit():
     thash = hashlib.blake2b((TOKEN or "").encode(), digest_size=8).hexdigest()
     logging.info("TOKEN hash (last8) = %s", thash)
     logging.info("INSTANCE_TAG = %r", INSTANCE_TAG)
     global SINGLETON_CONN, SINGLETON_KEY
     if not ENFORCE_SINGLETON:
-        logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled."); return
+        logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled.")
+        return
 
     SINGLETON_KEY = _advisory_key()
-    logging.info(f"Singleton key = {SINGLETON_KEY}")
-    # Retry settings
-    max_wait = int(os.getenv("SINGLETON_MAX_WAIT_SECONDS", "300"))  # default 5min
+    logging.info("Singleton key = %s", SINGLETON_KEY)
+    max_wait = int(os.getenv("SINGLETON_MAX_WAIT_SECONDS", "300"))
     interval = max(1, int(os.getenv("SINGLETON_RETRY_INTERVAL", "5")))
     waited = 0
 
     while True:
         try:
-            SINGLETON_CONN = engine.raw_connection()
+            # Fresh connection dedicated to advisory lock
+            SINGLETON_CONN = psycopg.connect(DATABASE_URL, connect_timeout=10)
             cur = SINGLETON_CONN.cursor()
-            app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
-            cur.execute("SET application_name = %s", (app_name,))
-            logging.info("application_name = %s", app_name)
             cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
-            ok = bool(cur.fetchone()[0])
-            if ok:
-                logging.info("Singleton advisory lock acquired.")
+            got = cur.fetchone()[0]
+            if got:
+                logging.info("✅ Acquired advisory lock.")
                 break
-            else:
-                if waited >= max_wait:
-                    logging.error("Could not acquire advisory lock after %ss; continuing WITHOUT singleton (set ALLOW_MULTI=0 to enforce).", waited)
-                    return
-                wait_left = max_wait - waited
-                logging.warning("Another instance holds the advisory lock. Waiting %ss (left %ss)...", interval, wait_left)
-                try:
-                    cur.close(); SINGLETON_CONN.close()
-                except Exception:
-                    pass
-                time.sleep(interval)
-                waited += interval
-                continue
-        except Exception as e:
-            logging.error(f"Singleton lock attempt failed: {e}")
+            # didn't get the lock
             try:
-                if SINGLETON_CONN: SINGLETON_CONN.close()
-            except Exception: ...
-            if waited >= max_wait:
-                logging.error("Exceeded max wait; continuing WITHOUT singleton.")
-                return
-            time.sleep(interval)
-            waited += interval
+                SINGLETON_CONN.close()
+            except Exception:
+                ...
+        except Exception as e:
+            logging.warning("Advisory lock attempt failed: %s", e)
+
+        if waited >= max_wait:
+            logging.error("Could not acquire advisory lock in %ss; exiting.", max_wait)
+            raise SystemExit(0)
+
+        wait_left = max_wait - waited
+        logging.warning("Another instance holds the lock. Waiting %ss (left %ss)...", interval, wait_left)
+        time.sleep(interval)
+        waited += interval
 
     @atexit.register
     def _unlock():
         try:
-            cur = SINGLETON_CONN.cursor()
-            cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
-            SINGLETON_CONN.close()
+            if SINGLETON_CONN:
+                cur = SINGLETON_CONN.cursor()
+                cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
+                SINGLETON_CONN.close()
         except Exception:
             ...
-    def _unlock():
-        try:
-            cur=SINGLETON_CONN.cursor(); cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,)); SINGLETON_CONN.close()
-        except Exception: ...
 
 async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
     if not ENFORCE_SINGLETON: return
@@ -764,7 +747,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q or not q.message: return
     await q.answer(); data=q.data or ""; msg=q.message
-    user_id=q.from_user.id; chat_id=msg.chat.id; key=(chat_id, msg.message_id)
+    user_a_id=q.from_user.id; chat_id=msg.chat.id; key=(chat_id, msg.message_id)
 
     meta=PANELS.get(key)
     if not meta: PANELS[key]={"owner": user_id, "stack":[]}; meta=PANELS[key]
@@ -969,9 +952,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await panel_edit(context, msg, user_id, "تاریخ نامعتبر بود.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
             # remove previous relationships for both
-            s.execute(Relationship.__table__.delete().where((Relationship.chat_id==chat_id) & ((Relationship.user_id==me.id) | (Relationship.user_b_id==me.id) | (Relationship.user_id==other.id) | (Relationship.user_b_id==other.id))))
+            s.execute(Relationship.__table__.delete().where((Relationship.chat_id==chat_id) & ((Relationship.user_a_id==me.id) | (Relationship.user_b_id==me.id) | (Relationship.user_a_id==other.id) | (Relationship.user_b_id==other.id))))
             ua, ub = (me.id, other.id) if me.id < other.id else (other.id, me.id)
-            s.add(Relationship(chat_id=chat_id, user_id=ua, user_b_id=ub, started_at=gdate))
+            s.add(Relationship(chat_id=chat_id, user_a_id=ua, user_b_id=ub, started_at=gdate))
             s.commit()
         await panel_edit(context, msg, user_id, f"✅ رابطه ثبت شد از {fmt_date_fa(gdate)}", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
         try:
@@ -1068,7 +1051,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m:
             gid=int(m.group(1))
             with SessionLocal() as s:
-                if not (user_id==OWNER_ID or is_seller(s, user_id)):
+                if not (user_a_id==OWNER_ID or is_seller(s, user_id)):
                     await panel_edit(context, msg, user_id, "فقط مالک/فروشنده.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
                 g=s.get(Group, gid)
                 if not g: await panel_edit(context, msg, user_id, "گروه پیدا نشد.", [[InlineKeyboardButton("بازگشت", callback_data="adm:groups:0")]], root=True); return
@@ -1381,9 +1364,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             me = upsert_user(s3, g.id, update.effective_user)
             # ذخیره سمت DB (ساخت جفت مرتب user_a/user_b)
             ua, ub = (me.id, target_user.id) if me.id < target_user.id else (target_user.id, me.id)
-            rel = s3.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_id==ua, Relationship.user_b_id==ub)).scalar_one_or_none()
+            rel = s3.execute(select(Relationship).where(Relationship.chat_id==g.id, Relationship.user_a_id==ua, Relationship.user_b_id==ub)).scalar_one_or_none()
             if not rel:
-                rel = Relationship(chat_id=g.id, user_id=ua, user_b_id=ub, started_at=gdate); s3.add(rel)
+                rel = Relationship(chat_id=g.id, user_a_id=ua, user_b_id=ub, started_at=gdate); s3.add(rel)
             else:
                 rel.started_at = gdate
             s3.commit()
@@ -1496,7 +1479,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mentions=[mention_of(u) for u in users]
         buf=""; out=[]
         for m_ in mentions:
-            if len(buf)+len(m_)+1>3000:
+            if len(buf)+len(m_)+1>3500:
                 out.append(buf); buf=""
             buf += ("" if not buf else " ") + m_
         if buf: out.append(buf)
@@ -1531,17 +1514,15 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await reply_temp(update, context, "این بخش برای دیگران فقط مخصوص ادمین‌هاست."); return
             info = build_profile_caption(s2, g, target_user)
         try:
-            if not SKIP_PROFILE_PHOTO:
-        try:
             photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
             if photos.total_count>0:
                 file_id = photos.photos[0][-1].file_id
                 await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-                return
+            else:
+                await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
         except Exception:
-            ...
-    await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-    return
+            await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+        return
     # (deprecated) داده‌های من → حالا از طریق «آیدی/ایدی» انجام می‌شود
     if text in ("داده های من","داده‌های من","ایدی داده های من"):
         text = "آیدی داده های من"
@@ -1578,7 +1559,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if me.gender not in ("male","female"):
                 await reply_temp(update, context, "اول جنسیتت رو ثبت کن: «ثبت جنسیت دختر/پسر»."); return
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
-            in_rel=set([r.user_id for r in rels]+[r.user_b_id for r in rels])
+            in_rel=set([r.user_a_id for r in rels]+[r.user_b_id for r in rels])
             if me.id in in_rel:
                 await reply_temp(update, context, "تو در رابطه‌ای. برای پیشنهاد باید سینگل باشی."); return
             opposite="female" if me.gender=="male" else "male"
@@ -1601,7 +1582,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u=s2.execute(select(User).where(User.chat_id==update.effective_chat.id, User.tg_user_id==update.effective_user.id)).scalar_one_or_none()
             if not u: await reply_temp(update, context, "اطلاعاتی از شما نداریم."); return
             s2.execute(Crush.__table__.delete().where((Crush.chat_id==update.effective_chat.id)&((Crush.from_user_id==u.id)|(Crush.to_user_id==u.id))))
-            s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==update.effective_chat.id)&((Relationship.user_id==u.id)|(Relationship.user_b_id==u.id))))
+            s2.execute(Relationship.__table__.delete().where((Relationship.chat_id==update.effective_chat.id)&((Relationship.user_a_id==u.id)|(Relationship.user_b_id==u.id))))
             s2.execute(ReplyStatDaily.__table__.delete().where((ReplyStatDaily.chat_id==update.effective_chat.id)&(ReplyStatDaily.target_user_id==u.id)))
             s2.execute(User.__table__.delete().where((User.chat_id==update.effective_chat.id)&(User.id==u.id)))
             s2.commit()
@@ -1742,7 +1723,7 @@ async def job_midnight(context: ContextTypes.DEFAULT_TYPE):
             males=s.query(User).filter_by(chat_id=g.id, gender="male").all()
             females=s.query(User).filter_by(chat_id=g.id, gender="female").all()
             rels=s.query(Relationship).filter_by(chat_id=g.id).all()
-            in_rel=set([r.user_id for r in rels]+[r.user_b_id for r in rels])
+            in_rel=set([r.user_a_id for r in rels]+[r.user_b_id for r in rels])
             males=[u for u in males if u.id not in in_rel]; females=[u for u in females if u.id not in in_rel]
             if males and females:
                 muser=random.choice(males); fuser=random.choice(females)
@@ -1767,7 +1748,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                 if not r.started_at: continue
                 rm, rd = to_jalali_md(r.started_at)
                 if rd==jd:
-                    ua, ub = s.get(User, r.user_id), s.get(User, r.user_b_id)
+                    ua, ub = s.get(User, r.user_a_id), s.get(User, r.user_b_id)
                     try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
@@ -1852,7 +1833,6 @@ def main():
 
 
 
-
 async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as s:
         sellers = s.execute(select(Seller).order_by(Seller.id.asc())).scalars().all()
@@ -1863,5 +1843,4 @@ async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for se in sellers:
         status = "فعال" if se.is_active else "غیرفعال"
         lines.append(f"- آیدی عددی: {fa_digits(str(se.tg_user_id))} | وضعیت: {status} | یادداشت: {se.note or '-'}")
-    await safe_send(update.effective_chat.send_message, "
-".join(lines))
+    await safe_send(update.effective_chat.send_message, "\n".join(lines))
