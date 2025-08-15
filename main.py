@@ -407,6 +407,10 @@ def _acquire_lock(conn, key: int) -> bool:
     cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)", (key,)); ok=cur.fetchone()[0]; return bool(ok)
 
 def acquire_singleton_or_exit():
+    thash = hashlib.blake2b((TOKEN or "").encode(), digest_size=8).hexdigest()
+    logging.info("TOKEN hash (last8) = %s", thash)
+    logging.info("INSTANCE_TAG = %r", INSTANCE_TAG)
+
     global SINGLETON_CONN, SINGLETON_KEY
     if DISABLE_SINGLETON:
         logging.warning("⚠️ DISABLE_SINGLETON=1 → singleton guard disabled."); return
@@ -414,7 +418,9 @@ def acquire_singleton_or_exit():
     try:
         SINGLETON_CONN = engine.raw_connection()
         cur = SINGLETON_CONN.cursor()
-        cur.execute("SET application_name = %s", (f"fazolbot:{INSTANCE_TAG or 'bot'}",))
+        app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
+        cur.execute("SET application_name = %s", (app_name,))
+        logging.info("application_name = %s", app_name)
         ok = _acquire_lock(SINGLETON_CONN, SINGLETON_KEY)
         if not ok:
             logging.error("Another instance is already running (PG advisory lock). Exiting.")
@@ -441,7 +447,9 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
             except Exception: ...
             SINGLETON_CONN=engine.raw_connection()
             cur=SINGLETON_CONN.cursor()
-            cur.execute("SET application_name = %s", (f"fazolbot:{INSTANCE_TAG or 'bot'}",))
+            app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
+        cur.execute("SET application_name = %s", (app_name,))
+        logging.info("application_name = %s", app_name)
             cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,)); ok=cur.fetchone()[0]
             if not ok: logging.error("Lost advisory lock, another instance holds it. Exiting."); os._exit(0)
             logging.info("Advisory lock re-acquired.")
