@@ -1138,7 +1138,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
 
     await panel_edit(context, msg, user_id, "دستور ناشناخته یا منقضی.",
-                     [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)    q=update.callback_query
+                     [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)
     if not q or not q.message: return
     await q.answer(); data=q.data or ""; msg=q.message
     user_a_id=q.from_user.id; chat_id=msg.chat.id; key=(chat_id, msg.message_id)
