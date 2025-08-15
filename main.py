@@ -700,6 +700,59 @@ class Seller(Base):
 
 # ================== CREATE TABLES & EXTRA INDEXES ==================
 Base.metadata.create_all(bind=engine)
+
+# ================== DB HELPERS (ensure/upsert) ==================
+def ensure_group(s, chat) -> Group:
+    """Ensure Group row exists for given chat (group/supergroup)."""
+    gid = chat.id
+    g = s.get(Group, gid)
+    if not g:
+        title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or str(gid)
+        g = Group(id=gid, title=title, timezone=None, trial_started_at=dt.datetime.utcnow())
+        s.add(g)
+        try:
+            s.commit()
+        except Exception:
+            s.rollback()
+            g = s.get(Group, gid)
+    else:
+        title = getattr(chat, "title", None) or getattr(chat, "full_name", None)
+        if title and g.title != title:
+            g.title = title
+            try:
+                s.commit()
+            except Exception:
+                s.rollback()
+    return g
+
+def upsert_user(s, chat_id: int, tg_user) -> User:
+    """Ensure User row exists/updated for (chat_id, tg_user.id)."""
+    uid = tg_user.id
+    u = s.execute(select(User).where(User.chat_id == chat_id, User.tg_user_id == uid)).scalar_one_or_none()
+    if not u:
+        u = User(
+            chat_id=chat_id,
+            tg_user_id=uid,
+            first_name=getattr(tg_user, "first_name", None),
+            last_name=getattr(tg_user, "last_name", None),
+            username=(getattr(tg_user, "username", None) or None),
+            gender="unknown"
+        )
+        s.add(u)
+    else:
+        fn = getattr(tg_user, "first_name", None)
+        ln = getattr(tg_user, "last_name", None)
+        un = getattr(tg_user, "username", None) or None
+        changed = False
+        if fn is not None and u.first_name != fn: u.first_name = fn; changed = True
+        if ln is not None and u.last_name != ln: u.last_name = ln; changed = True
+        if u.username != un: u.username = un; changed = True
+    try:
+        s.commit()
+    except Exception:
+        s.rollback()
+        u = s.execute(select(User).where(User.chat_id == chat_id, User.tg_user_id == uid)).scalar_one_or_none()
+    return u
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE UNIQUE INDEX IF NOT EXISTS ix_rel_unique ON relationships (chat_id, user_a_id, user_b_id);
