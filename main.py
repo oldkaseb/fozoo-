@@ -118,6 +118,7 @@ if not INSTANCE_TAG:
     INSTANCE_TAG = hashlib.blake2b(f"{os.getenv('RAILWAY_SERVICE_NAME','')}-{os.getpid()}".encode(), digest_size=4).hexdigest()
 
 DEFAULT_TZ = "Asia/Tehran"
+SKIP_PROFILE_PHOTO = os.getenv("SKIP_PROFILE_PHOTO", "1").strip().lower() in ("1","true","yes")
 TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
 
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
@@ -1514,15 +1515,21 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await reply_temp(update, context, "این بخش برای دیگران فقط مخصوص ادمین‌هاست."); return
             info = build_profile_caption(s2, g, target_user)
         try:
-            photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
-            if photos.total_count>0:
-                file_id = photos.photos[0][-1].file_id
-                await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-            else:
-                await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-        except Exception:
+            if not SKIP_PROFILE_PHOTO:
+                try:
+                    photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
+                    if photos.total_count>0:
+                        file_id = photos.photos[0][-1].file_id
+                        await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+                        return
+                except Exception:
+                    ...
             await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-        return
+            return
+        except Exception:
+            ...
+    await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+    return
     # (deprecated) داده‌های من → حالا از طریق «آیدی/ایدی» انجام می‌شود
     if text in ("داده های من","داده‌های من","ایدی داده های من"):
         text = "آیدی داده های من"
@@ -1803,12 +1810,9 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     # Handlers
-    app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("panel", cmd_panel))
-    app.add_handler(CommandHandler("charge", cmd_charge))
-    app.add_handler(CommandHandler("help", cmd_help))
-
+    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول منو$"), send_text_menu), group=0)
+    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^(?:راهنما|help|کمک)$"), cmd_help), group=0)
+    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول$"), lambda u,c: c.bot.send_message(u.effective_chat.id, "من اینجام 😉")), group=0)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -1844,3 +1848,27 @@ async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "فعال" if se.is_active else "غیرفعال"
         lines.append(f"- آیدی عددی: {fa_digits(str(se.tg_user_id))} | وضعیت: {status} | یادداشت: {se.note or '-'}")
     await safe_send(update.effective_chat.send_message, "\n".join(lines))
+
+
+async def send_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    try:
+        is_op = is_operator(user.id)
+    except Exception:
+        is_op = False
+    base = [
+        "🧭 منوی متنی فضول:",
+        "• «ثبت جنسیت دختر/پسر»",
+        "• «ثبت تولد YYYY/MM/DD»",
+        "• «ثبت رل [ریپلای/@/آیدی] [YYYY/MM/DD|امروز]»",
+        "• «کراشام» | «ثبت کراش [ریپلای/@/آیدی]» | «حذف کراش [ریپلای/@/آیدی]»",
+        "• «ایدی» | «محبوب امروز» | «شیپم کن» | «شیپ امشب»",
+    ]
+    if is_op:
+        base += [
+            "",
+            "— بخش ادمین (فقط برای شما):",
+            "• «لیست گروه‌ها»، «تمدید/شارژ گروه»، «خروج از گروه»، «پاکسازی داده‌ها»",
+        ]
+    await safe_send(chat.send_message, "\n".join(base))
