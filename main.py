@@ -1513,7 +1513,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
-    # ==== TEXT-ONLY COMMANDS (no menus) ====
+    # Health check
+    if text.strip() == "فضول":
+        await reply_temp(update, context, "زهرمار"); return
+    
+    # Owner panel (text trigger)
+    if text.strip() in ("پنل","پنل مالک","پنل فضول"):
+        if update.effective_user.id != OWNER_ID:
+            await reply_temp(update, context, "این بخش مخصوص مالک است."); return
+        await cmd_panel(update, context); return
+# ==== TEXT-ONLY COMMANDS (no menus) ====
     # کمک/راهنما
     if text.strip() in ("راهنما","کمک"):
         await cmd_help(update, context); return
@@ -2394,6 +2403,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await on_start(update, context)
 
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # OWNER-only guard
+    if update.effective_user.id != OWNER_ID:
+        await reply_temp(update, context, "این بخش مخصوص مالک است."); return
     uid=update.effective_user.id
     with SessionLocal() as s:
         if not (uid==OWNER_ID or is_seller(s, uid)):
@@ -2716,6 +2728,7 @@ def main():
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Jobs
