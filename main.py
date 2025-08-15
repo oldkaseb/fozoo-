@@ -301,41 +301,6 @@ def mention_of(u: "User") -> str:
     name = u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
     return f'<a href="tg://user?id={u.tg_user_id}">{name}</a>'
 
-
-def build_profile_caption(s, g, me) -> str:
-    # Crushes
-    my_crushes = s.query(Crush).filter_by(chat_id=g.id, from_user_id=me.id).all()
-    crush_list = []
-    for r in my_crushes[:20]:
-        u = s.get(User, r.to_user_id)
-        if u:
-            crush_list.append(mention_of(u))
-    # Relationship
-    rel = s.query(Relationship).filter_by(chat_id=g.id).filter((Relationship.user_a_id==me.id)|(Relationship.user_b_id==me.id)).first()
-    rel_txt = "-"
-    if rel:
-        other_id = rel.user_b_id if rel.user_a_id==me.id else rel.user_a_id
-        other = s.get(User, other_id)
-        other_name = other and mention_of(other)
-        if other_name:
-            rel_txt = f"{other_name} — از {fmt_date_fa(rel.started_at)}"
-    # Popularity
-    today=dt.datetime.now(TZ_TEHRAN).date()
-    my_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today, ReplyStatDaily.target_user_id==me.id)).scalar_one_or_none()
-    max_row=s.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today).order_by(ReplyStatDaily.reply_count.desc()).limit(1)).scalar_one_or_none()
-    score=0
-    if my_row and max_row and max_row.reply_count>0:
-        score=round(10 * my_row.reply_count / max_row.reply_count)
-    info=(
-        f"👤 نام: {me.first_name or ''} @{me.username or ''}\n"
-        f"جنسیت: {'دختر' if me.gender=='female' else ('پسر' if me.gender=='male' else 'نامشخص')}\n"
-        f"تولد: {fmt_date_fa(me.birthday)}\n"
-        f"کراش‌ها: {', '.join(crush_list) if crush_list else '-'}\n"
-        f"رابطه: {rel_txt}\n"
-        f"محبوبیت امروز: {score}/10"
-    )
-    return info
-
 def footer(text: str) -> str: return text
 
 async def reply_temp(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
@@ -897,6 +862,29 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key_wait=(update.effective_chat.id, update.effective_user.id)
     if REL_USER_WAIT.get(key_wait):
         sel=text.strip()
+        # allow text-based "انتخاب از لیست"
+        if sel in ("انتخاب از لیست","از لیست","انتخاب از لیست ", "انتخاب از‌لیست"):
+            with SessionLocal() as s2:
+                g=ensure_group(s2, update.effective_chat)
+                me=upsert_user(s2, g.id, update.effective_user)
+                page=0; per=10; offset=page*per
+                rows_db=s2.execute(
+                    select(User).where(User.chat_id==g.id, User.id!=me.id)
+                    .order_by(func.lower(User.first_name).asc(), User.id.asc())
+                    .offset(offset).limit(per)
+                ).scalars().all()
+                total_cnt=s2.execute(select(func.count()).select_from(User).where(User.chat_id==g.id)).scalar() or 0
+            if not rows_db:
+                await reply_temp(update, context, "کسی در لیست یافت نشد. از «جستجو» استفاده کن یا از طرف مقابل بخواه یک پیام بدهد."); 
+                return
+            btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:picktg:{u.tg_user_id}")] for u in rows_db]
+            nav=[]
+            if total_cnt > offset+per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{page+1}"))
+            if nav: btns.append(nav)
+            btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
+            await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True); 
+            return
+
         if sel in ("لغو","انصراف"):
             REL_USER_WAIT.pop(key_wait, None)
             await reply_temp(update, context, "لغو شد."); 
@@ -1009,35 +997,10 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         tgid=int(selector)
                         target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                     except Exception: target_user=None
-            # ✅ If target is resolved now, open the date wizard immediately
-            if target_user:
-                if target_user.tg_user_id==update.effective_user.id:
-                    await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
-                    return
-                _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
-                y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
-                for ch in chunked(years,4):
-                    rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
-                rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
-                await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
-                return
-
             if not target_user:
                 rows=[[InlineKeyboardButton("انصراف", callback_data="nav:close")]]
                 msg = await panel_open_initial(update, context, "ثبت رابطه — @یوزرنیم یا آیدی عددی طرف مقابل را بفرست", rows, root=True)
                 REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
-                return
-            # If target user already resolved, open date wizard
-            if target_user:
-                if target_user.tg_user_id==update.effective_user.id:
-                    await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
-                    return
-                _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
-                y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
-                for ch in chunked(years,4):
-                    rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
-                rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
-                await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
                 return
     # birthday set# birthday set
     m=re.match(r"^ثبت تولد ([\d\/\-]+)$", text)
@@ -1109,83 +1072,44 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             names=[]
             for r in rows[:20]:
                 u=s2.get(User, r.to_user_id)
-                if u: names.append(mention_of(u))
-            await reply_temp(update, context, "💘 کراش‌های تو:\n" + "\n".join(f"- {n}" for n in names), keep=True, parse_mode=ParseMode.HTML)
+                if u: names.append(u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))
+            await reply_temp(update, context, "💘 کراش‌های تو:\n" + "\n".join(f"- {n}" for n in names), keep=True)
         return
 
-    # tag commands (reply-based): تگ دخترها / تگ پسرها / تگ همه
-    if text in ("تگ دخترها","تگ پسرها","تگ همه"):
-        if not update.message.reply_to_message:
-            await reply_temp(update, context, "باید روی یک پیام ریپلای کنی."); return
-        with SessionLocal() as s2:
-            g=ensure_group(s2, update.effective_chat)
-            # gender filter
-            gender=None
-            if text=="تگ دخترها": gender="female"
-            elif text=="تگ پسرها": gender="male"
-            q = s2.query(User).filter_by(chat_id=g.id)
-            if gender: q = q.filter(User.gender==gender)
-            users=q.limit(500).all()
-            if not users:
-                await reply_temp(update, context, "کسی با این معیار پیدا نکردم."); return
-            mentions=[mention_of(u) for u in users]
-        # chunk to avoid telegram 4096 cap
-        buf=""; out=[]
-        for m in mentions:
-            if len(buf)+len(m)+1>3500:
-                out.append(buf); buf=""
-            buf += ("" if not buf else " ") + m
-        if buf: out.append(buf)
-        for part in out[:6]:
-            await reply_temp(update, context, part, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.reply_to_message.message_id)
-        return
-
-
-
-    if text.startswith("آیدی"):
-        with SessionLocal() as s2:
-            g=ensure_group(s2, update.effective_chat)
-            me=upsert_user(s2, g.id, update.effective_user)
-            parts=text.split(maxsplit=1)
-            selector=(parts[1].strip() if len(parts)>1 else "")
-            target_user=None
-            # cases: reply wins; then selector (@/id or "داده های من"); else self
-            if update.message.reply_to_message:
-                target_user=upsert_user(s2, g.id, update.message.reply_to_message.from_user)
-            elif selector in ("داده های من","داده‌های من","داده-های-من","me","خودم","خود") or selector=="":
-                target_user=me
-            elif selector.startswith("@"):
-                uname=selector[1:].lower()
-                target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
-            else:
-                try:
-                    tgid=int(selector)
-                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
-                except Exception:
-                    target_user=None
-            if not target_user:
-                await reply_temp(update, context, "کاربر پیدا نشد. ریپلای کن یا «آیدی داده های من» یا @/آیدی بده."); return
-            # privacy: اگر شخص دیگری است → ادمین/اپراتور لازم است
-            if target_user.tg_user_id != me.tg_user_id:
-                if not (is_group_admin(s2, g.id, me.tg_user_id) or is_operator(s2, me.tg_user_id)):
-                    await reply_temp(update, context, "این بخش برای دیگران فقط مخصوص ادمین‌هاست."); return
-            info = build_profile_caption(s2, g, target_user)
-        try:
-            photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
-            if photos.total_count>0:
-                file_id = photos.photos[0][-1].file_id
-                await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-            else:
-                await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-        except Exception:
-            await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-
-        return
-    # (deprecated) داده‌های من → حالا از طریق «آیدی» انجام می‌شود
     if text in ("داده های من","داده‌های من"):
-        text = "آیدی داده های من"
-        # fallthrough to آیدی handler below
-
+        with SessionLocal() as s2:
+            g=ensure_group(s2, update.effective_chat)
+            me=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==update.effective_user.id)).scalar_one_or_none()
+            if not me:
+                await reply_temp(update, context, "چیزی از شما ذخیره نشده."); return
+            my_crushes=s2.query(Crush).filter_by(chat_id=g.id, from_user_id=me.id).all()
+            crush_list=[]
+            for r in my_crushes[:20]:
+                u=s2.get(User, r.to_user_id)
+                if u: crush_list.append(u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))
+            rel=s2.query(Relationship).filter_by(chat_id=g.id).filter((Relationship.user_a_id==me.id)|(Relationship.user_b_id==me.id)).first()
+            rel_txt="-"
+            if rel:
+                other_id = rel.user_b_id if rel.user_a_id==me.id else rel.user_a_id
+                other = s2.get(User, other_id)
+                other_name = other and (other.first_name or (other.username and "@"+other.username) or str(other.tg_user_id))
+                rel_txt = f"{other_name or '-'} از {fmt_date_fa(rel.started_at) if rel.started_at else '-'}"
+            today=dt.datetime.now(TZ_TEHRAN).date()
+            my_row=s2.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today, ReplyStatDaily.target_user_id==me.id)).scalar_one_or_none()
+            max_row=s2.execute(select(ReplyStatDaily).where(ReplyStatDaily.chat_id==g.id, ReplyStatDaily.date==today).order_by(ReplyStatDaily.reply_count.desc()).limit(1)).scalar_one_or_none()
+            score=0
+            if my_row and max_row and max_row.reply_count>0:
+                score=round(10 * my_row.reply_count / max_row.reply_count)
+            info=(
+                f"👤 نام: {me.first_name or ''} @{me.username or ''}\n"
+                f"جنسیت: {'دختر' if me.gender=='female' else ('پسر' if me.gender=='male' else 'نامشخص')}\n"
+                f"تولد: {fmt_date_fa(me.birthday)}\n"
+                f"کراش‌ها: {', '.join(crush_list) if crush_list else '-'}\n"
+                f"رابطه: {rel_txt}\n"
+                f"محبوبیت امروز: {score}/10"
+            )
+            await reply_temp(update, context, info, keep=True)
+        return
 
     if text=="محبوب امروز":
         today=dt.datetime.now(TZ_TEHRAN).date()
@@ -1197,9 +1121,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as s3:
             for i,r in enumerate(rows, start=1):
                 u=s3.get(User, r.target_user_id)
-                name=mention_of(u)
+                name=u.first_name or (u.username and f"@{u.username}") or str(u.tg_user_id)
                 lines.append(f"{fa_digits(i)}) {name} — {fa_digits(r.reply_count)} ریپلای")
-        await reply_temp(update, context, "\n".join(lines), keep=True, parse_mode=ParseMode.HTML); return
+        await reply_temp(update, context, "\n".join(lines), keep=True); return
 
     if text=="شیپ امشب":
         today=dt.datetime.now(TZ_TEHRAN).date()
