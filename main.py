@@ -1777,6 +1777,16 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
 async def _post_init(application: Application):
     logging.info('Post-init: deleting webhook & prepping polling…')
     try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logging.info('Webhook deleted (drop_pending_updates=True)')
+    except Exception as e:
+        logging.warning('delete_webhook failed: %s', e)
+    try:
+        me = await application.bot.get_me()
+        logging.info('Bot OK: @%s (id=%s)', getattr(me, 'username', '?'), me.id)
+    except Exception as e:
+        logging.error('get_me failed: %s', e)
+    try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         logging.info("Webhook deleted. Polling is active.")
     except Exception as e:
@@ -1819,6 +1829,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_temp(update, context, user_help_text(), keep=True)
 
 def main():
+    logging.info('Boot sanity: env TELEGRAM_TOKEN=%s OWNER_ID=%s DB=%s', '***' if os.getenv('TELEGRAM_TOKEN') else 'MISSING', os.getenv('OWNER_ID','-'), 'set' if os.getenv('DATABASE_URL') else 'unset')
+    try:
+        from sqlalchemy import text as _sqltext
+        with engine.begin() as _conn:
+            _conn.execute(_sqltext('SELECT 1'))
+        logging.info('DB sanity OK (SELECT 1)')
+    except Exception as e:
+        logging.error('DB sanity FAILED: %s', e)
 
     if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
     acquire_singleton_or_exit()
