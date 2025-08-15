@@ -1,9 +1,16 @@
 
 # -*- coding: utf-8 -*-
-# Fazol Bot — build with relationship wizard, operator-restricted actions,
-# improved /start flows, crush list, "my data", owner panel (groups & sellers),
-# textual charge trigger, and owner reports.
-# python-telegram-bot v21+
+# Fazol Bot — complete build
+# Features:
+# - Relationship wizard (step-by-step): pick user (list/search/reply/@/id) → pick date (Jalali: year→month→day)
+# - Crush add/remove + "کراشام"
+# - "داده‌های من" (gender, birthday, crushes, relationship, popularity /10)
+# - Owner panel (groups & sellers), "پنل اینجا" in-group quick panel
+# - Group charge & wipe (owner/seller only), textual "فضول شارژ"
+# - Menus hide admin-only options for normal users
+# - Owner reports to PV
+# - Polling mode with webhook deletion, PG advisory singleton
+# Requires: python-telegram-bot[job-queue]>=21, SQLAlchemy, psycopg[binary], persiantools
 
 import os
 import re
@@ -20,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     create_engine, select, text, Integer, BigInteger, String, DateTime,
-    Date, Boolean, JSON, ForeignKey, Index
+    Date, Boolean, JSON, ForeignKey, Index, func
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column
 
@@ -185,6 +192,7 @@ class User(Base):
     first_name: Mapped[Optional[str]]=mapped_column(String(128))
     last_name: Mapped[Optional[str]]=mapped_column(String(128))
     username: Mapped[Optional[str]]=mapped_column(String(128), index=True)
+    last_seen: Mapped[Optional[dt.datetime]]=mapped_column(DateTime)
     gender: Mapped[str]=mapped_column(String(8), default="unknown")
     birthday: Mapped[Optional[dt.date]]=mapped_column(Date)
 
@@ -248,6 +256,8 @@ class Seller(Base):
     is_active: Mapped[bool]=mapped_column(Boolean, default=True)
 
 Base.metadata.create_all(bind=engine)
+with engine.begin() as conn:
+    conn.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS last_seen timestamp"))
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE UNIQUE INDEX IF NOT EXISTS ix_rel_unique ON relationships (chat_id, user_a_id, user_b_id);
@@ -326,6 +336,7 @@ def upsert_user(session, chat_id: int, tg_user) -> "User":
     u.first_name = tg_user.first_name or u.first_name
     u.last_name = tg_user.last_name or u.last_name
     u.username = tg_user.username or u.username
+    u.last_seen = dt.datetime.utcnow()
     session.flush(); return u
 
 def group_active(g: "Group") -> bool:
@@ -360,6 +371,7 @@ def add_nav(rows: List[List[InlineKeyboardButton]], root: bool = False) -> Inlin
 PANELS: Dict[Tuple[int,int], Dict[str, Any]] = {}
 REL_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
 SELLER_WAIT: Dict[int, Dict[str, Any]] = {}
+REL_USER_WAIT: Dict[Tuple[int,int], Dict[str, Any]] = {}
 
 def _panel_key(chat_id: int, message_id: int) -> Tuple[int,int]: return (chat_id, message_id)
 def _panel_push(msg, owner_id: int, title: str, rows, root: bool):
@@ -454,7 +466,7 @@ def user_help_text() -> str:
         "• «فضول منو» → منوی دکمه‌ای\n"
         "• «ثبت جنسیت دختر/پسر» (ادمین: با ریپلای برای دیگران)\n"
         "• «ثبت تولد ۱۴۰۳/۰۵/۲۰» (ادمین: با ریپلای برای دیگران)\n"
-        "• «ثبت رابطه» (ریپلای/@/آیدی) → ویزارد تاریخ\n"
+        "• «ثبت رابطه» → انتخاب از لیست/جستجو → سال/ماه/روز\n"
         "• «کراشام» → لیست کراش‌ها\n"
         "• «داده‌های من» → پروفایل کامل + محبوبیت\n"
         "• «محبوب امروز»، «شیپم کن»، «شیپ امشب»\n"
@@ -535,7 +547,41 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{chat_id}:180")]]
         await panel_edit(context, msg, user_id, "⌁ پنل شارژ گروه", kb, root=False); return
 
-    # --- Relationship wizard callbacks ---
+    # --- Relationship extra selectors ---
+    m=re.match(r"^rel:list:(\d+)$", data)
+    if m:
+        page=int(m.group(1)); per=10; offset=page*per
+        with SessionLocal() as s:
+            me=s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
+            q=select(User).where(User.chat_id==chat_id)
+            if me: q=q.where(User.id!=me.id)
+            rows_db=s.execute(q.order_by(User.last_seen.desc().nullslast()).offset(offset).limit(per)).scalars().all()
+            total_cnt=s.execute(select(func.count()).select_from(User).where(User.chat_id==chat_id)).scalar() or 0
+        if not rows_db:
+            await panel_edit(context, msg, user_id, "کسی در لیست نیست. از «جستجو» استفاده کن.", [[InlineKeyboardButton("جستجو", callback_data="rel:ask")]], root=False); return
+        btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:pick:{u.id}")] for u in rows_db]
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"rel:list:{page-1}"))
+        if total_cnt > offset+per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{page+1}"))
+        if nav: btns.append(nav)
+        btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
+        await panel_edit(context, msg, user_id, "از لیست انتخاب کن", btns, root=False); return
+
+    m=re.match(r"^rel:pick:(\d+)$", data)
+    if m:
+        target_user_id=int(m.group(1))
+        _set_rel_wait(chat_id, user_id, target_user_id)
+        y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+        for ch in chunked(years,4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+        await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
+
+    if data=="rel:ask":
+        REL_USER_WAIT[(chat_id, user_id)]={"ts": dt.datetime.utcnow().timestamp()}
+        await panel_edit(context, msg, user_id, "یوزرنیم را با @ یا آیدی عددی را بفرست (یا بنویس «لغو»).", [[InlineKeyboardButton("برگشت", callback_data="nav:back")]], root=False); return
+
+    # --- Relationship date wizard ---
     m=re.match(r"^rel:yp:(\d+)$", data)
     if m:
         start=int(m.group(1))
@@ -576,19 +622,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await panel_edit(context, msg, user_id, "کاربرها پیدا نشدند. دوباره امتحان کن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
             try:
                 if HAS_PTOOLS:
-                    from persiantools.jdatetime import JalaliDate
                     gdate=JalaliDate(y,mth,dd).to_gregorian()
                 else:
                     gdate=dt.date(y, mth, dd)
             except Exception:
                 await panel_edit(context, msg, user_id, "تاریخ نامعتبر بود.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+            # remove previous relationships for both
             s.execute(Relationship.__table__.delete().where((Relationship.chat_id==chat_id) & ((Relationship.user_a_id==me.id) | (Relationship.user_b_id==me.id) | (Relationship.user_a_id==other.id) | (Relationship.user_b_id==other.id))))
             ua, ub = (me.id, other.id) if me.id < other.id else (other.id, me.id)
             s.add(Relationship(chat_id=chat_id, user_a_id=ua, user_b_id=ub, started_at=gdate))
             s.commit()
         await panel_edit(context, msg, user_id, f"✅ رابطه ثبت شد از {fmt_date_fa(gdate)}", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False)
         try:
-            await notify_owner(context, f"[گزارش] رابطه در گروه {chat_id} ثبت شد: {user_id} با {other.tg_user_id} از {fmt_date_fa(gdate)}")
+            await notify_owner(context, f"[گزارش] رابطه در گروه {chat_id} ثبت شد: {me.tg_user_id} با {other.tg_user_id} از {fmt_date_fa(gdate)}")
         except Exception: ...
         return
 
@@ -739,7 +785,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hints={
             "ui:crush:add":"برای «ثبت کراش»، روی پیام شخص ریپلای کن و بنویس «ثبت کراش». یا: «ثبت کراش @username / 123456»",
             "ui:crush:del":"برای «حذف کراش»، مانند بالا عمل کن.",
-            "ui:rel:help":"«ثبت رابطه» را با ریپلای/یوزرنیم/@ID بزن؛ بعد تاریخ را از کیبورد انتخاب کن.",
+            "ui:rel:help":"«ثبت رابطه» را بزن؛ از لیست انتخاب کن یا جستجو کن؛ سپس تاریخ را انتخاب کن.",
             "ui:tag:girls":"برای «تگ دخترها»، روی یک پیام ریپلای کن و بنویس: تگ دخترها",
             "ui:tag:boys":"برای «تگ پسرها»، روی یک پیام ریپلای کن و بنویس: تگ پسرها",
             "ui:tag:all":"برای «تگ همه»، روی یک پیام ریپلای کن و بنویس: تگ همه",
@@ -771,33 +817,6 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "کمک" in text or "راهنما" in text:
             await reply_temp(update, context, user_help_text()); return
 
-    # universal owner menu trigger in group
-    if text in ("پنل مالک","پنل","مدیریت"):
-        with SessionLocal() as s_own:
-            if (update.effective_user.id==OWNER_ID) or is_seller(s_own, update.effective_user.id):
-                rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
-                      [InlineKeyboardButton("🛍️ فروشنده‌ها", callback_data="adm:sellers")]]
-                await panel_open_initial(update, context, "پنل مالک", rows, root=True)
-                return
-
-    with SessionLocal() as s:
-        g=ensure_group(s, update.effective_chat)
-        me=upsert_user(s, g.id, update.effective_user)
-
-    # textual open charge
-    if "فضول" in text and "شارژ" in text:
-        with SessionLocal() as s:
-            g=ensure_group(s, update.effective_chat)
-            if not (is_operator(s, update.effective_user.id) or is_group_admin(s, g.id, update.effective_user.id)):
-                await reply_temp(update, context, "دسترسی نداری.")
-                return
-        kb=[[InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{update.effective_chat.id}:30"),
-             InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{update.effective_chat.id}:90"),
-             InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{update.effective_chat.id}:180")]]
-        await panel_open_initial(update, context, "⌁ پنل شارژ گروه", kb, root=True)
-        return
-
-
     # owner quick panel for THIS group
     if text == "پنل اینجا":
         with SessionLocal() as s:
@@ -816,6 +835,23 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await panel_open_initial(update, context, f"مدیریت گروه\n{title}\nID: {g.id}\nانقضا: {ex}", rows, root=True)
         return
 
+    with SessionLocal() as s:
+        g=ensure_group(s, update.effective_chat)
+        me=upsert_user(s, g.id, update.effective_user)
+
+    # textual open charge
+    if "فضول" in text and "شارژ" in text:
+        with SessionLocal() as s:
+            g=ensure_group(s, update.effective_chat)
+            if not (is_operator(s, update.effective_user.id) or is_group_admin(s, g.id, update.effective_user.id)):
+                await reply_temp(update, context, "دسترسی نداری.")
+                return
+        kb=[[InlineKeyboardButton("۳۰ روز", callback_data=f"chg:{update.effective_chat.id}:30"),
+             InlineKeyboardButton("۹۰ روز", callback_data=f"chg:{update.effective_chat.id}:90"),
+             InlineKeyboardButton("۱۸۰ روز", callback_data=f"chg:{update.effective_chat.id}:180")]]
+        await panel_open_initial(update, context, "⌁ پنل شارژ گروه", kb, root=True)
+        return
+
     # gender
     m=re.match(r"^ثبت جنسیت (دختر|پسر)$", text)
     if m:
@@ -832,7 +868,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_temp(update, context, f"👤 جنسیت {who} ثبت شد: {'👧 دختر' if target.gender=='female' else '👦 پسر'}", parse_mode=ParseMode.HTML)
         return
 
-    # relationship start (reply/@/id) -> year picker
+    # relationship start (reply/@/id) -> or open chooser
     m=re.match(r"^ثبت رابطه(?:\s+(.+))?$", text)
     if m:
         selector=(m.group(1) or "").strip()
@@ -843,16 +879,56 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_user=upsert_user(s2, g.id, update.message.reply_to_message.from_user)
             elif selector:
                 if selector.startswith("@"):
-                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.username==selector[1:])).scalar_one_or_none()
+                    uname=selector[1:].lower()
+                    target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
                 else:
                     try:
                         tgid=int(selector)
                         target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                     except Exception: target_user=None
             if not target_user:
-                await reply_temp(update, context, "طرف مقابل پیدا نشد. با ریپلای یا @یوزرنیم یا آیدی عددی دوباره امتحان کن."); return
+                rows=[
+                    [InlineKeyboardButton("👥 انتخاب از لیست", callback_data="rel:list:0")],
+                    [InlineKeyboardButton("🔎 جستجوی @یوزرنیم/آیدی", callback_data="rel:ask")],
+                ]
+                await panel_open_initial(update, context, "ثبت رابطه — طرف مقابل را انتخاب کن", rows, root=True)
+                return
             if target_user.id==me.id:
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); return
+            _set_rel_wait(g.id, me.tg_user_id, target_user.id)
+            y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+            for ch in chunked(years,4):
+                rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+            rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+            await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+        return
+
+    # waiting for username/id in relationship
+    key_wait=(update.effective_chat.id, update.effective_user.id)
+    if REL_USER_WAIT.get(key_wait):
+        sel=text.strip()
+        if sel in ("لغو","انصراف"):
+            REL_USER_WAIT.pop(key_wait, None)
+            await reply_temp(update, context, "لغو شد."); 
+            return
+        with SessionLocal() as s2:
+            g=ensure_group(s2, update.effective_chat); me=upsert_user(s2, g.id, update.effective_user)
+            target_user=None
+            if sel.startswith("@"):
+                uname=sel[1:].lower()
+                target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
+            else:
+                try:
+                    tgid=int(sel)
+                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
+                except Exception: target_user=None
+            if not target_user:
+                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن."); 
+                return
+            if target_user.tg_user_id==update.effective_user.id:
+                await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
+                return
+            REL_USER_WAIT.pop(key_wait, None)
             _set_rel_wait(g.id, me.tg_user_id, target_user.id)
             y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
             for ch in chunked(years,4):
@@ -894,7 +970,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_user = upsert_user(s2, g.id, update.message.reply_to_message.from_user)
             elif selector:
                 if selector.startswith("@"):
-                    target_user = s2.execute(select(User).where(User.chat_id==g.id, User.username==selector[1:])).scalar_one_or_none()
+                    target_user = s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==selector[1:].lower())).scalar_one_or_none()
                 else:
                     try:
                         tgid = int(selector)
@@ -1062,7 +1138,6 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")]]
             await panel_open_initial(update, context, "📋 لیست گروه‌ها", rows, root=True); return
 
-
         # quick open owner panel by text
         if text in ("پنل مالک","پنل","مدیریت"):
             rows=[[InlineKeyboardButton("📋 لیست گروه‌ها", callback_data="adm:groups:0")],
@@ -1112,7 +1187,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "• «فضول منو» → منوی دکمه‌ای\n"
              "• «فضول کمک» → راهنما")
         await reply_temp(update, context, txt); return
-    # private: owner panel or user intro
+    # private
     uid = update.effective_user.id
     with SessionLocal() as s:
         seller = is_seller(s, uid)
@@ -1194,6 +1269,13 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
+async def _post_init(app: Application):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Webhook deleted. Polling is active.")
+    except Exception as e:
+        logging.warning(f"post_init webhook delete failed: {e}")
+    logging.info(f"PersianTools enabled: {HAS_PTOOLS}")
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username=context.bot.username
@@ -1229,13 +1311,6 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_temp(update, context, user_help_text(), keep=True)
-async def _post_init(app: Application):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logging.info("Webhook deleted. Polling is active.")
-    except Exception as e:
-        logging.warning(f"post_init webhook delete failed: {e}")
-    logging.info(f"PersianTools enabled: {HAS_PTOOLS}")
 
 def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var is required.")
@@ -1248,6 +1323,7 @@ def main():
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("charge", cmd_charge))
     app.add_handler(CommandHandler("help", cmd_help))
+
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
