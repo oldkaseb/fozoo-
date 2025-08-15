@@ -207,9 +207,20 @@ def fa_norm(s: str) -> str:
     s = s.replace("\u202a","").replace("\u202c","")
     s = re.sub(r"\s+"," ", s).strip()
     return s
+
+def footer(s: str) -> str:
+    # Minimal footer wrapper; customize if needed.
+    return s
+
 def clean_text(s: str) -> str: return fa_norm(s)
 
 RE_WORD_FAZOL = re.compile(rf"(?:^|[{re.escape(PUNCS)}])فضول(?:[{re.escape(PUNCS)}]|$)")
+
+
+def footer(s: str) -> str:
+    # Minimal footer wrapper; customize if needed.
+    return s
+
 
 try:
     import psycopg; _DRIVER="psycopg"
