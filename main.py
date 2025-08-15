@@ -118,7 +118,6 @@ if not INSTANCE_TAG:
     INSTANCE_TAG = hashlib.blake2b(f"{os.getenv('RAILWAY_SERVICE_NAME','')}-{os.getpid()}".encode(), digest_size=4).hexdigest()
 
 DEFAULT_TZ = "Asia/Tehran"
-SKIP_PROFILE_PHOTO = os.getenv("SKIP_PROFILE_PHOTO", "1").strip().lower() in ("1","true","yes")
 TZ_TEHRAN = ZoneInfo(DEFAULT_TZ)
 
 OWNER_CONTACT_USERNAME = os.getenv("OWNER_CONTACT", "soulsownerbot")
@@ -581,45 +580,67 @@ def _acquire_lock(conn, key: int) -> bool:
     cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)", (key,)); ok=cur.fetchone()[0]; return bool(ok)
 
 
+
 def acquire_singleton_or_exit():
-    thash = hashlib.blake2b((TOKEN or "").encode(), digest_size=8).hexdigest()
-    logging.info("TOKEN hash (last8) = %s", thash)
-    logging.info("INSTANCE_TAG = %r", INSTANCE_TAG)
+    """Acquire a Postgres advisory lock so only one bot instance runs.
+    Uses psycopg (v3) if available; otherwise falls back to psycopg2.
+    Never crashes silently; logs every step.
+    """
+    import logging, time
+    thash = hashlib.blake2b((TOKEN or "").encode(), digest_size=6).hexdigest()
+    logging.info("TOKEN hash (last6)=%s INSTANCE_TAG=%r", thash, INSTANCE_TAG)
     global SINGLETON_CONN, SINGLETON_KEY
     if not ENFORCE_SINGLETON:
         logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled.")
         return
 
+    # compute 64-bit key
     SINGLETON_KEY = _advisory_key()
-    logging.info("Singleton key = %s", SINGLETON_KEY)
+    logging.info("Singleton key=%s", SINGLETON_KEY)
+
     max_wait = int(os.getenv("SINGLETON_MAX_WAIT_SECONDS", "300"))
     interval = max(1, int(os.getenv("SINGLETON_RETRY_INTERVAL", "5")))
     waited = 0
 
+    # choose driver
+    _driver = None
+    try:
+        import psycopg  # type: ignore
+        _driver = "psycopg"
+    except Exception:
+        try:
+            import psycopg2  # type: ignore
+            _driver = "psycopg2"
+        except Exception as e:
+            logging.error("❌ Neither psycopg nor psycopg2 available: %s", e)
+            raise
+
     while True:
         try:
-            # Fresh connection dedicated to advisory lock
-            SINGLETON_CONN = psycopg.connect(DATABASE_URL, connect_timeout=10)
+            if _driver == "psycopg":
+                import psycopg  # type: ignore
+                SINGLETON_CONN = psycopg.connect(DATABASE_URL, connect_timeout=10)
+            else:
+                import psycopg2  # type: ignore
+                SINGLETON_CONN = psycopg2.connect(DATABASE_URL, connect_timeout=10)
             cur = SINGLETON_CONN.cursor()
             cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
             got = cur.fetchone()[0]
             if got:
-                logging.info("✅ Acquired advisory lock.")
+                logging.info("✅ Advisory lock acquired.")
                 break
-            # didn't get the lock
             try:
                 SINGLETON_CONN.close()
             except Exception:
                 ...
         except Exception as e:
-            logging.warning("Advisory lock attempt failed: %s", e)
+            logging.warning("Lock attempt failed: %s", e)
 
         if waited >= max_wait:
-            logging.error("Could not acquire advisory lock in %ss; exiting.", max_wait)
+            logging.error("❌ Could not acquire advisory lock in %ss; exiting.", max_wait)
             raise SystemExit(0)
-
         wait_left = max_wait - waited
-        logging.warning("Another instance holds the lock. Waiting %ss (left %ss)...", interval, wait_left)
+        logging.warning("Another instance holds the lock. Sleep %ss (left %ss)...", interval, wait_left)
         time.sleep(interval)
         waited += interval
 
@@ -1515,21 +1536,15 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await reply_temp(update, context, "این بخش برای دیگران فقط مخصوص ادمین‌هاست."); return
             info = build_profile_caption(s2, g, target_user)
         try:
-            if not SKIP_PROFILE_PHOTO:
-                try:
-                    photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
-                    if photos.total_count>0:
-                        file_id = photos.photos[0][-1].file_id
-                        await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-                        return
-                except Exception:
-                    ...
-            await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-            return
+            photos = await context.bot.get_user_profile_photos(target_user.tg_user_id, limit=1)
+            if photos.total_count>0:
+                file_id = photos.photos[0][-1].file_id
+                await context.bot.send_photo(update.effective_chat.id, file_id, caption=info, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+            else:
+                await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
         except Exception:
-            ...
-    await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
-    return
+            await reply_temp(update, context, info, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+        return
     # (deprecated) داده‌های من → حالا از طریق «آیدی/ایدی» انجام می‌شود
     if text in ("داده های من","داده‌های من","ایدی داده های من"):
         text = "آیدی داده های من"
@@ -1759,7 +1774,8 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
-async def _post_init(app: Application):
+async def _post_init(application: Application):
+    logging.info('Post-init: deleting webhook & prepping polling…')
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         logging.info("Webhook deleted. Polling is active.")
@@ -1810,10 +1826,13 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     # Handlers
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول منو$"), send_text_menu), group=0)
+
+
+
+    app.    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول منو$"), send_text_menu), group=0)
     app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^(?:راهنما|help|کمک)$"), cmd_help), group=0)
     app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول$"), lambda u,c: c.bot.send_message(u.effective_chat.id, "من اینجام 😉")), group=0)
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
+    add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -1848,27 +1867,3 @@ async def cmd_list_sellers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "فعال" if se.is_active else "غیرفعال"
         lines.append(f"- آیدی عددی: {fa_digits(str(se.tg_user_id))} | وضعیت: {status} | یادداشت: {se.note or '-'}")
     await safe_send(update.effective_chat.send_message, "\n".join(lines))
-
-
-async def send_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    try:
-        is_op = is_operator(user.id)
-    except Exception:
-        is_op = False
-    base = [
-        "🧭 منوی متنی فضول:",
-        "• «ثبت جنسیت دختر/پسر»",
-        "• «ثبت تولد YYYY/MM/DD»",
-        "• «ثبت رل [ریپلای/@/آیدی] [YYYY/MM/DD|امروز]»",
-        "• «کراشام» | «ثبت کراش [ریپلای/@/آیدی]» | «حذف کراش [ریپلای/@/آیدی]»",
-        "• «ایدی» | «محبوب امروز» | «شیپم کن» | «شیپ امشب»",
-    ]
-    if is_op:
-        base += [
-            "",
-            "— بخش ادمین (فقط برای شما):",
-            "• «لیست گروه‌ها»، «تمدید/شارژ گروه»، «خروج از گروه»، «پاکسازی داده‌ها»",
-        ]
-    await safe_send(chat.send_message, "\n".join(base))
