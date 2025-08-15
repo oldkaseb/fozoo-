@@ -858,16 +858,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
+    # Allow typing "انتخاب از لیست" to open the chooser even without tapping the button
+    if text.replace("‌","").strip() in ("انتخاب از لیست","انتخاب از ليست","از لیست","از ليست"):
+        with SessionLocal() as s2:
+            g=ensure_group(s2, update.effective_chat); me=upsert_user(s2, g.id, update.effective_user)
+            page=0; per=10; offset=0
+            rows_db=s2.execute(
+                select(User).where(User.chat_id==g.id, User.id!=me.id)
+                .order_by(func.lower(User.first_name).asc(), User.id.asc())
+                .offset(offset).limit(per)
+            ).scalars().all()
+            total_cnt=s2.execute(select(func.count()).select_from(User).where(User.chat_id==g.id)).scalar() or 0
+        if not rows_db:
+            await reply_temp(update, context, "کسی در لیست نیست. از طرف مقابل بخواه یک پیام بدهد یا «جستجو» را بزن."); return
+        btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:picktg:{u.tg_user_id}")] for u in rows_db]
+        nav=[]
+        if total_cnt > per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{1}"))
+        if nav: btns.append(nav)
+        btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
+        msg = await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
+        # Put the session in waiting mode so that user can also type @/id afterwards
+        REL_USER_WAIT[(update.effective_chat.id, update.effective_user.id)] = {"ts": dt.datetime.utcnow().timestamp(), "panel_key": (msg.chat.id, msg.message_id)}
+        return
+
     # EARLY: waiting for username/id from "rel:ask"
     key_wait=(update.effective_chat.id, update.effective_user.id)
     if REL_USER_WAIT.get(key_wait):
         sel=text.strip()
-        # allow text-based "انتخاب از لیست"
-        if sel in ("انتخاب از لیست","از لیست","انتخاب از لیست ", "انتخاب از‌لیست"):
+        # Also accept typing "انتخاب از لیست" while waiting
+        if sel.replace("‌","").strip() in ("انتخاب از لیست","انتخاب از ليست","از لیست","از ليست"):
             with SessionLocal() as s2:
-                g=ensure_group(s2, update.effective_chat)
-                me=upsert_user(s2, g.id, update.effective_user)
-                page=0; per=10; offset=page*per
+                g=ensure_group(s2, update.effective_chat); me=upsert_user(s2, g.id, update.effective_user)
+                page=0; per=10; offset=0
                 rows_db=s2.execute(
                     select(User).where(User.chat_id==g.id, User.id!=me.id)
                     .order_by(func.lower(User.first_name).asc(), User.id.asc())
@@ -875,14 +897,13 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ).scalars().all()
                 total_cnt=s2.execute(select(func.count()).select_from(User).where(User.chat_id==g.id)).scalar() or 0
             if not rows_db:
-                await reply_temp(update, context, "کسی در لیست یافت نشد. از «جستجو» استفاده کن یا از طرف مقابل بخواه یک پیام بدهد."); 
-                return
+                await reply_temp(update, context, "کسی در لیست نیست. از «جستجو» استفاده کن یا از طرف مقابل بخواه یک پیام بدهد."); return
             btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:picktg:{u.tg_user_id}")] for u in rows_db]
             nav=[]
-            if total_cnt > offset+per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{page+1}"))
+            if total_cnt > per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{1}"))
             if nav: btns.append(nav)
             btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
-            await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True); 
+            await panel_open_initial(update, context, "از لیست انتخاب کن", btns, root=True)
             return
 
         if sel in ("لغو","انصراف"):
@@ -1075,6 +1096,33 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if u: names.append(u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))
             await reply_temp(update, context, "💘 کراش‌های تو:\n" + "\n".join(f"- {n}" for n in names), keep=True)
         return
+
+    # tag commands (reply-based): تگ دخترها / تگ پسرها / تگ همه (با/بی فاصله)
+    if text in ("تگ دخترها","تگ دختر ها","تگ پسرها","تگ پسر ها","تگ همه"):
+        if not update.message.reply_to_message:
+            await reply_temp(update, context, "باید روی یک پیام ریپلای کنی."); return
+        with SessionLocal() as s2:
+            g=ensure_group(s2, update.effective_chat)
+            # gender filter
+            gender=None
+            if text in ("تگ دخترها","تگ دختر ها"): gender="female"
+            elif text in ("تگ پسرها","تگ پسر ها"): gender="male"
+            q = s2.query(User).filter_by(chat_id=g.id)
+            if gender: q = q.filter(User.gender==gender)
+            users=q.limit(500).all()
+            if not users:
+                await reply_temp(update, context, "کسی با این معیار پیدا نکردم."); return
+            mentions=[mention_of(u) for u in users]
+        buf=""; out=[]
+        for m_ in mentions:
+            if len(buf)+len(m_)+1>3500:
+                out.append(buf); buf=""
+            buf += ("" if not buf else " ") + m_
+        if buf: out.append(buf)
+        for part in out[:6]:
+            await reply_temp(update, context, part, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.reply_to_message.message_id)
+        return
+
 
     if text in ("داده های من","داده‌های من"):
         with SessionLocal() as s2:
