@@ -385,8 +385,10 @@ def _panel_pop(msg):
     if len(meta["stack"])>1:
         meta["stack"].pop(); prev=meta["stack"][-1]; PANELS[key]=meta; return prev
     return None
-def _set_rel_wait(chat_id: int, actor_tg: int, target_user_id: int):
-    REL_WAIT[(chat_id, actor_tg)]={"target_user_id": target_user_id}
+def _set_rel_wait(chat_id: int, actor_tg: int, target_user_id: int, target_tgid: int | None = None):
+    ctx={"target_user_id": target_user_id};
+    if target_tgid: ctx["target_tgid"]=target_tgid
+    REL_WAIT[(chat_id, actor_tg)]=ctx
 def _pop_rel_wait(chat_id: int, actor_tg: int):
     return REL_WAIT.pop((chat_id, actor_tg), None)
 
@@ -578,7 +580,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await panel_edit(context, msg, user_id, "کاربر پیدا نشد. ممکن است از گروه خارج شده باشد.", [[InlineKeyboardButton("برگشت", callback_data="rel:list:0")]], root=False); return
         if target.tg_user_id==user_id:
             await panel_edit(context, msg, user_id, "نمی‌تونی با خودت رابطه ثبت کنی.", [[InlineKeyboardButton("برگشت", callback_data="rel:list:0")]], root=False); return
-        _set_rel_wait(chat_id, user_id, target.id)
+        _set_rel_wait(chat_id, user_id, target.id, target.tg_user_id)
         y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
         for ch in chunked(years,4):
             rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
@@ -635,8 +637,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as s:
             me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
             other = s.get(User, target_user_id) if target_user_id else None
+            if not other:
+                tgid = ctx.get('target_tgid') if ctx else None
+                if tgid:
+                    other = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tgid)).scalar_one_or_none()
             if not (me and other):
-                await panel_edit(context, msg, user_id, "کاربرها پیدا نشدند. دوباره امتحان کن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
+                await panel_edit(context, msg, user_id, "کاربرها پیدا نشدند. از او بخواه یک پیام بدهد یا دوباره تلاش کن.", [[InlineKeyboardButton("باشه", callback_data="nav:close")]], root=False); return
             try:
                 if HAS_PTOOLS:
                     gdate=JalaliDate(y,mth,dd).to_gregorian()
@@ -847,7 +853,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
                 return
             REL_USER_WAIT.pop(key_wait, None)
-            _set_rel_wait(g.id, me.tg_user_id, target_user.id)
+            _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
             y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
             for ch in chunked(years,4):
                 rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
@@ -946,7 +952,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if target_user.id==me.id:
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); return
-            _set_rel_wait(g.id, me.tg_user_id, target_user.id)
+            _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
             y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
             for ch in chunked(years,4):
                 rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
@@ -980,7 +986,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
                 return
             REL_USER_WAIT.pop(key_wait, None)
-            _set_rel_wait(g.id, me.tg_user_id, target_user.id)
+            _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
             y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
             for ch in chunked(years,4):
                 rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
