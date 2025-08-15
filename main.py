@@ -559,7 +559,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_cnt=s.execute(select(func.count()).select_from(User).where(User.chat_id==chat_id)).scalar() or 0
         if not rows_db:
             await panel_edit(context, msg, user_id, "کسی در لیست نیست. از «جستجو» استفاده کن.", [[InlineKeyboardButton("جستجو", callback_data="rel:ask")]], root=False); return
-        btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:pick:{u.id}")] for u in rows_db]
+        btns=[[InlineKeyboardButton((u.first_name or (u.username and "@"+u.username) or str(u.tg_user_id))[:30], callback_data=f"rel:picktg:{u.tg_user_id}")] for u in rows_db]
         nav=[]
         if page>0: nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"rel:list:{page-1}"))
         if total_cnt > offset+per: nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"rel:list:{page+1}"))
@@ -567,6 +567,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         btns.append([InlineKeyboardButton("🔎 جستجو", callback_data="rel:ask")])
         await panel_edit(context, msg, user_id, "از لیست انتخاب کن", btns, root=False); return
 
+
+    m=re.match(r"^rel:picktg:(\d+)$", data)
+    if m:
+        tgid=int(m.group(1))
+        with SessionLocal() as s:
+            target = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==tgid)).scalar_one_or_none()
+            me = s.execute(select(User).where(User.chat_id==chat_id, User.tg_user_id==user_id)).scalar_one_or_none()
+        if not target or not me:
+            await panel_edit(context, msg, user_id, "کاربر پیدا نشد. ممکن است از گروه خارج شده باشد.", [[InlineKeyboardButton("برگشت", callback_data="rel:list:0")]], root=False); return
+        if target.tg_user_id==user_id:
+            await panel_edit(context, msg, user_id, "نمی‌تونی با خودت رابطه ثبت کنی.", [[InlineKeyboardButton("برگشت", callback_data="rel:list:0")]], root=False); return
+        _set_rel_wait(chat_id, user_id, target.id)
+        y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+        for ch in chunked(years,4):
+            rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+        rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+        await panel_edit(context, msg, user_id, "شروع رابطه — سال را انتخاب کن", rows, root=False); return
     m=re.match(r"^rel:pick:(\d+)$", data)
     if m:
         target_user_id=int(m.group(1))
@@ -804,6 +821,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
+    # EARLY: waiting for username/id from "rel:ask"
+    key_wait=(update.effective_chat.id, update.effective_user.id)
+    if REL_USER_WAIT.get(key_wait):
+        sel=text.strip()
+        if sel in ("لغو","انصراف"):
+            REL_USER_WAIT.pop(key_wait, None)
+            await reply_temp(update, context, "لغو شد."); 
+            return
+        with SessionLocal() as s2:
+            g=ensure_group(s2, update.effective_chat); me=upsert_user(s2, g.id, update.effective_user)
+            target_user=None
+            if sel.startswith("@"):
+                uname=sel[1:].lower()
+                target_user=s2.execute(select(User).where(User.chat_id==g.id, func.lower(User.username)==uname)).scalar_one_or_none()
+            else:
+                try:
+                    tgid=int(sel)
+                    target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
+                except Exception: target_user=None
+            if not target_user:
+                await reply_temp(update, context, "کاربر پیدا نشد. از او بخواه یک پیام بدهد یا از «انتخاب از لیست» استفاده کن."); 
+                return
+            if target_user.tg_user_id==update.effective_user.id:
+                await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
+                return
+            REL_USER_WAIT.pop(key_wait, None)
+            _set_rel_wait(g.id, me.tg_user_id, target_user.id)
+            y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+            for ch in chunked(years,4):
+                rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+            rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+            await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+        return
+
 
     if RE_WORD_FAZOL.search(text):
         if "منو" in text or "فهرست" in text:
