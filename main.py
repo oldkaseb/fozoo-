@@ -12,6 +12,44 @@
 # - Polling mode with webhook deletion, PG advisory singleton
 # Requires: python-telegram-bot[job-queue]>=21, SQLAlchemy, psycopg[binary], persiantools
 
+
+# === DSN Resolver (injected) ===
+def _resolve_db_dsn() -> str:
+    """
+    Resolve a PostgreSQL DSN robustly.
+    Priority:
+      1) module-global DATABASE_URL
+      2) engine.url (if an SQLAlchemy engine exists)
+      3) os.environ["DATABASE_URL"]
+      4) Build from PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE (+ sslmode=require by default)
+    """
+    try:
+        dburl = globals().get("DATABASE_URL")
+        if dburl:
+            return dburl
+    except Exception:
+        ...
+    try:
+        eng = globals().get("engine")
+        if eng:
+            return str(eng.url)
+    except Exception:
+        ...
+    import os as _os
+    env_dsn = _os.getenv("DATABASE_URL")
+    if env_dsn:
+        return env_dsn
+    host = _os.getenv("PGHOST")
+    db   = _os.getenv("PGDATABASE")
+    user = _os.getenv("PGUSER")
+    pwd  = _os.getenv("PGPASSWORD")
+    port = _os.getenv("PGPORT", "5432")
+    if host and db and user and pwd:
+        sslmode = _os.getenv("PGSSLMODE", "require")
+        return f"postgresql://{user}:{pwd}@{host}:{port}/{db}?sslmode={sslmode}"
+    raise RuntimeError("No DATABASE_URL or PG* variables found; set DATABASE_URL or PGHOST/PGUSER/PGPASSWORD/PGDATABASE")
+# === End DSN Resolver (injected) ===
+
 import os
 import re
 # -*- coding: utf-8 -*-
@@ -579,73 +617,69 @@ def _advisory_key() -> int:
 def _acquire_lock(conn, key: int) -> bool:
     cur=conn.cursor(); cur.execute("SELECT pg_try_advisory_lock(%s)", (key,)); ok=cur.fetchone()[0]; return bool(ok)
 
-
 def acquire_singleton_or_exit():
-    import logging, time
-    thash = hashlib.blake2b((TOKEN or '').encode(), digest_size=6).hexdigest()
-    logging.info('TOKEN hash (last6)=%s INSTANCE_TAG=%r', thash, INSTANCE_TAG)
+    thash = hashlib.blake2b((TOKEN or "").encode(), digest_size=8).hexdigest()
+    logging.info("TOKEN hash (last8) = %s", thash)
+    logging.info("INSTANCE_TAG = %r", INSTANCE_TAG)
     global SINGLETON_CONN, SINGLETON_KEY
     if not ENFORCE_SINGLETON:
-        logging.warning('⚠️ ALLOW_MULTI=1 → singleton guard disabled.')
-        return
+        logging.warning("⚠️ ALLOW_MULTI=1 → singleton guard disabled."); return
 
-    # Pick DSN robustly
-    try:
-        dsn = _resolve_db_dsn()
-    except Exception as e:
-        logging.error('❌ DB DSN resolution failed: %s', e)
-        raise
-
-    # compute advisory key
     SINGLETON_KEY = _advisory_key()
-    logging.info('Singleton key=%s', SINGLETON_KEY)
-
-    max_wait = int(os.getenv('SINGLETON_MAX_WAIT_SECONDS', '300'))
-    interval = max(1, int(os.getenv('SINGLETON_RETRY_INTERVAL', '5')))
+    logging.info(f"Singleton key = {SINGLETON_KEY}")
+    # Retry settings
+    max_wait = int(os.getenv("SINGLETON_MAX_WAIT_SECONDS", "300"))  # default 5min
+    interval = max(1, int(os.getenv("SINGLETON_RETRY_INTERVAL", "5")))
     waited = 0
-
-    # choose driver
-    try:
-        import psycopg as _pg
-        drv = 'psycopg'
-    except Exception:
-        try:
-            import psycopg2 as _pg
-            drv = 'psycopg2'
-        except Exception as ee:
-            logging.error('❌ Neither psycopg nor psycopg2 is available: %s', ee)
-            raise
 
     while True:
         try:
-            SINGLETON_CONN = _pg.connect(dsn, connect_timeout=10)
+            SINGLETON_CONN = engine.raw_connection()
             cur = SINGLETON_CONN.cursor()
-            cur.execute('SELECT pg_try_advisory_lock(%s)', (SINGLETON_KEY,))
-            row = cur.fetchone()
-            got = bool(row[0]) if row else False
-            if got:
-                logging.info('✅ Advisory lock acquired (driver=%s).', drv)
+            app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
+            cur.execute("SET application_name = %s", (app_name,))
+            logging.info("application_name = %s", app_name)
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,))
+            ok = bool(cur.fetchone()[0])
+            if ok:
+                logging.info("Singleton advisory lock acquired.")
                 break
-            # Did not get the lock, close and wait
-            try: SINGLETON_CONN.close()
-            except Exception: ...
-            logging.warning('Another instance holds the lock. Sleep %ss…', interval)
+            else:
+                if waited >= max_wait:
+                    logging.error("Could not acquire advisory lock after %ss; continuing WITHOUT singleton (set ALLOW_MULTI=0 to enforce).", waited)
+                    return
+                wait_left = max_wait - waited
+                logging.warning("Another instance holds the advisory lock. Waiting %ss (left %ss)...", interval, wait_left)
+                try:
+                    cur.close(); SINGLETON_CONN.close()
+                except Exception:
+                    pass
+                time.sleep(interval)
+                waited += interval
+                continue
         except Exception as e:
-            logging.warning('Lock attempt failed (%s). Retry in %ss…', e, interval)
-        if waited >= max_wait:
-            logging.error('❌ Could not acquire advisory lock in %ss; exiting.', max_wait)
-            raise SystemExit(0)
-        time.sleep(interval); waited += interval
+            logging.error(f"Singleton lock attempt failed: {e}")
+            try:
+                if SINGLETON_CONN: SINGLETON_CONN.close()
+            except Exception: ...
+            if waited >= max_wait:
+                logging.error("Exceeded max wait; continuing WITHOUT singleton.")
+                return
+            time.sleep(interval)
+            waited += interval
 
     @atexit.register
     def _unlock():
         try:
-            if SINGLETON_CONN:
-                cur = SINGLETON_CONN.cursor()
-                cur.execute('SELECT pg_advisory_unlock(%s)', (SINGLETON_KEY,))
-                SINGLETON_CONN.close()
+            cur = SINGLETON_CONN.cursor()
+            cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,))
+            SINGLETON_CONN.close()
         except Exception:
-            ...
+            ...@atexit.register
+    def _unlock():
+        try:
+            cur=SINGLETON_CONN.cursor(); cur.execute("SELECT pg_advisory_unlock(%s)", (SINGLETON_KEY,)); SINGLETON_CONN.close()
+        except Exception: ...
 
 async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
     if not ENFORCE_SINGLETON: return
@@ -1767,18 +1801,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     try: await context.bot.send_message(g.id, footer(f"💞 ماهگرد {(ua.first_name or '@'+(ua.username or ''))} و {(ub.first_name or '@'+(ub.username or ''))} مبارک! ({fmt_date_fa(r.started_at)})"))
                     except Exception: ...
 
-async def _post_init(application: Application):
-    logging.info('Post-init: deleting webhook & prepping polling…')
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        logging.info('Webhook deleted (drop_pending_updates=True)')
-    except Exception as e:
-        logging.warning('delete_webhook failed: %s', e)
-    try:
-        me = await application.bot.get_me()
-        logging.info('Bot OK: @%s (id=%s)', getattr(me, 'username', '?'), me.id)
-    except Exception as e:
-        logging.error('get_me failed: %s', e)
+async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
         logging.info("Webhook deleted. Polling is active.")
@@ -1829,13 +1852,13 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     # Handlers
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("charge", cmd_charge))
+    app.add_handler(CommandHandler("help", cmd_help))
 
-
-
-    app.    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول منو$"), send_text_menu), group=0)
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^(?:راهنما|help|کمک)$"), cmd_help), group=0)
-    app.add_handler(MessageHandler((filters.ChatType.GROUPS | filters.ChatType.PRIVATE) & filters.Regex(r"^فضول$"), lambda u,c: c.bot.send_message(u.effective_chat.id, "من اینجام 😉")), group=0)
-    add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
