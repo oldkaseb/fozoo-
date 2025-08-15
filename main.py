@@ -1009,6 +1009,19 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         tgid=int(selector)
                         target_user=s2.execute(select(User).where(User.chat_id==g.id, User.tg_user_id==tgid)).scalar_one_or_none()
                     except Exception: target_user=None
+            # ✅ If target is resolved now, open the date wizard immediately
+            if target_user:
+                if target_user.tg_user_id==update.effective_user.id:
+                    await reply_temp(update, context, "نمی‌تونی با خودت رابطه ثبت کنی."); 
+                    return
+                _set_rel_wait(g.id, me.tg_user_id, target_user.id, target_user.tg_user_id)
+                y=jalali_now_year(); years=list(range(y, y-16, -1)); rows=[]
+                for ch in chunked(years,4):
+                    rows.append([InlineKeyboardButton(fa_digits(str(yy)), callback_data=f"rel:y:{yy}") for yy in ch])
+                rows.append([InlineKeyboardButton("سال‌های قدیمی‌تر", callback_data=f"rel:yp:{y-16}")])
+                await reply_temp(update, context, "شروع رابطه — سال را انتخاب کن", reply_markup=InlineKeyboardMarkup(rows), keep=True)
+                return
+
             if not target_user:
                 rows=[[InlineKeyboardButton("انصراف", callback_data="nav:close")]]
                 msg = await panel_open_initial(update, context, "ثبت رابطه — @یوزرنیم یا آیدی عددی طرف مقابل را بفرست", rows, root=True)
@@ -1099,6 +1112,34 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if u: names.append(mention_of(u))
             await reply_temp(update, context, "💘 کراش‌های تو:\n" + "\n".join(f"- {n}" for n in names), keep=True, parse_mode=ParseMode.HTML)
         return
+
+    # tag commands (reply-based): تگ دخترها / تگ پسرها / تگ همه
+    if text in ("تگ دخترها","تگ پسرها","تگ همه"):
+        if not update.message.reply_to_message:
+            await reply_temp(update, context, "باید روی یک پیام ریپلای کنی."); return
+        with SessionLocal() as s2:
+            g=ensure_group(s2, update.effective_chat)
+            # gender filter
+            gender=None
+            if text=="تگ دخترها": gender="female"
+            elif text=="تگ پسرها": gender="male"
+            q = s2.query(User).filter_by(chat_id=g.id)
+            if gender: q = q.filter(User.gender==gender)
+            users=q.limit(500).all()
+            if not users:
+                await reply_temp(update, context, "کسی با این معیار پیدا نکردم."); return
+            mentions=[mention_of(u) for u in users]
+        # chunk to avoid telegram 4096 cap
+        buf=""; out=[]
+        for m in mentions:
+            if len(buf)+len(m)+1>3500:
+                out.append(buf); buf=""
+            buf += ("" if not buf else " ") + m
+        if buf: out.append(buf)
+        for part in out[:6]:
+            await reply_temp(update, context, part, keep=True, parse_mode=ParseMode.HTML, reply_to_message_id=update.message.reply_to_message.message_id)
+        return
+
 
 
     if text.startswith("آیدی"):
