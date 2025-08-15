@@ -448,8 +448,8 @@ async def singleton_watchdog(context: ContextTypes.DEFAULT_TYPE):
             SINGLETON_CONN=engine.raw_connection()
             cur=SINGLETON_CONN.cursor()
             app_name = f"fazolbot:{INSTANCE_TAG or 'bot'}"
-        cur.execute("SET application_name = %s", (app_name,))
-        logging.info("application_name = %s", app_name)
+            cur.execute("SET application_name = %s", (app_name,))
+            logging.info("application_name = %s", app_name)
             cur.execute("SELECT pg_try_advisory_lock(%s)", (SINGLETON_KEY,)); ok=cur.fetchone()[0]
             if not ok: logging.error("Lost advisory lock, another instance holds it. Exiting."); os._exit(0)
             logging.info("Advisory lock re-acquired.")
