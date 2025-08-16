@@ -12,18 +12,16 @@ ENV:
 - OWNER_ID: Telegram numeric ID of the bot owner (int)
 
 Run:
-    pip install python-telegram-bot==20.7 SQLAlchemy==2.0.29 pytz persiantools
+    pip install python-telegram-bot==20.7 SQLAlchemy==2.0.29 persiantools
     python main_final_deploy.py
 """
 
-import asyncio
 import logging
 import os
 import random
 import re
-from dataclasses import dataclass
 from datetime import datetime, date, time
-from typing import Optional, Tuple, List
+from typing import Optional, List
 
 from zoneinfo import ZoneInfo
 
@@ -33,22 +31,17 @@ from sqlalchemy import (
     func,
     ForeignKey,
     UniqueConstraint,
-    and_,
-    or_,
     Date,
     String,
     Integer,
     Boolean,
     DateTime,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 
 from telegram import (
     Update,
-    ChatMember,
-    ChatMemberAdministrator,
     ChatMemberOwner,
-    InputMediaPhoto,
 )
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
@@ -155,22 +148,51 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, future=True)
 Base.metadata.create_all(engine)
 
+# -------------------- Text Normalization --------------------
+_ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩"
+_PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
+_WESTERN_DIGITS = "0123456789"
+DIACRITICS = "".join([
+    "\u064B", "\u064C", "\u064D", "\u064E", "\u064F", "\u0650", "\u0651", "\u0652", "\u0670"
+])
+
+def normalize_fa(s: str) -> str:
+    if not s:
+        return s
+    # unify spaces
+    s = s.replace("\u200c", " ")  # ZWNJ -> space
+    s = s.replace("\u00A0", " ")  # NBSP
+    s = re.sub(r"\s+", " ", s)
+
+    # Arabic to Persian forms
+    s = s.replace("ي", "ی").replace("ك", "ک")
+
+    # Remove diacritics
+    s = s.translate({ord(d): None for d in DIACRITICS})
+
+    # Convert digits to western
+    trans = {}
+    for i, ch in enumerate(_ARABIC_DIGITS):
+        trans[ord(ch)] = ord(_WESTERN_DIGITS[i])
+    for i, ch in enumerate(_PERSIAN_DIGITS):
+        trans[ord(ch)] = ord(_WESTERN_DIGITS[i])
+    s = s.translate(trans)
+
+    return s.strip()
+
 # -------------------- Utilities --------------------
 def now_teh() -> datetime:
     return datetime.now(TZ)
 
 def parse_date_fa_or_en(s: str) -> Optional[date]:
-    """Accept YYYY-MM-DD or YYYY/MM/DD (Gregorian). If persian (Jalali) provided, convert if persiantools installed."""
-    s = s.strip()
+    s = normalize_fa(s or "")
     try:
-        # Detect delimiter
         if "/" in s:
             parts = s.split("/")
         else:
             parts = s.split("-")
         y, m, d = map(int, parts)
         if HAS_PTOOLS and y < 1700:
-            # Assume Jalali
             g = JalaliDate(y, m, d).to_gregorian()
             return date(g.year, g.month, g.day)
         else:
@@ -199,7 +221,6 @@ def get_or_create_user(session: Session, tg_user) -> User:
         session.add(u)
         session.commit()
     else:
-        # Update basic fields
         changed = False
         if u.username != tg_user.username:
             u.username = tg_user.username; changed = True
@@ -209,10 +230,8 @@ def get_or_create_user(session: Session, tg_user) -> User:
             u.last_name = tg_user.last_name; changed = True
         if changed:
             session.commit()
-    # Owner autoclaim
     if OWNER_ID and u.tg_id == OWNER_ID and not u.is_seller:
-        # owner can act as seller too
-        u.is_seller = True
+        u.is_seller = True  # owner can act as seller
         session.commit()
     return u
 
@@ -249,7 +268,6 @@ def increment_message_count(session: Session, chat, from_user):
 def hlink_for(user: User) -> str:
     if user.username:
         return f"@{user.username}"
-    # Escape names for HTML
     name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
     name = name.strip() or "کاربر"
     return f'<a href="tg://user?id={user.tg_id}">{name}</a>'
@@ -267,7 +285,7 @@ async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
         return False
 
 def resolve_token_to_user(session: Session, token: str) -> Optional[User]:
-    """token = '@username' or '123456' (id). Must have been seen before by the bot."""
+    token = normalize_fa(token or "")
     if token.startswith("@"):
         uname = token[1:].lower()
         return session.scalar(select(User).where(func.lower(User.username) == uname))
@@ -294,14 +312,22 @@ async def cache_avatar_file_id(context: ContextTypes.DEFAULT_TYPE, u: User):
         logger.warning(f"avatar cache failed for {u.tg_id}: {e}")
 
 def popularity_percent(session: Session, user: User) -> int:
-    # Based on number of people who crushed on this user
     cnt = session.scalar(select(func.count(Crush.id)).where(Crush.to_user_id == user.id)) or 0
-    # Smooth function
     val = min(100, round(10 * (cnt ** 0.5)))
     return val
 
+async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str, html: bool = True):
+    if not OWNER_ID:
+        return
+    try:
+        if html:
+            await context.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await context.bot.send_message(chat_id=OWNER_ID, text=text, disable_web_page_preview=True)
+    except Exception as e:
+        logger.warning(f"notify_owner failed: {e}")
+
 # -------------------- Triggers --------------------
-# Regex patterns (Persian)
 PAT_GENDER = re.compile(r"^ثبت\s+جنسیت\s+(پسر|دختر)$")
 PAT_BDAY = re.compile(r"^ثبت\s+تولد\s+(\d{4}[-/]\d{2}[-/]\d{2})$")
 PAT_PROFILE = re.compile(r"^(نمایش\s+اطلاعات|آیدی|نمایش\s+پروفایل)(?:\s+@[\w_]+)?$")
@@ -315,18 +341,27 @@ PAT_MYCRUSHES = re.compile(r"^کراشام$")
 PAT_THEIR = re.compile(r"^(کراشاش|کراشرهاش)$")
 PAT_CHARGE = re.compile(r"^شارژ(?:\s+@[\w_]+|\s+\d+)?\s+(\d+)$")
 PAT_PANEL = re.compile(r"^(پنل\s+مدیریت|پنل\s+اینجا)$")
+PAT_OWNER_PANEL = re.compile(r"^پنل\s+مالک$")
 PAT_HELP = re.compile(r"^راهنما$")
 PAT_CFG = re.compile(r"^(پیکربندی\s+فضول|به‌روزرسانی\s+مدیران)$")
 PAT_AUTOSHIP = re.compile(r"^شیپ\s+خودکار\s+(روشن|خاموش)$")
+# Owner PV tools
+PAT_GROUP_LIST = re.compile(r"^لیست\s+گروه‌ها$")
+PAT_GROUP_AUTOSHIP_SET = re.compile(r"^گروه\s+(-?\d+)\s+شیپ\s+خودکار\s+(روشن|خاموش)$")
+PAT_GROUP_REPORT = re.compile(r"^گروه\s+(-?\d+)\s+گزارش$")
+PAT_SEND_TO_GROUP = re.compile(r"^ارسال\s+گروه\s+(-?\d+)\s+(.+)$")
 
 # -------------------- Handlers --------------------
 async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.effective_user or not update.message:
         return
 
-    text = (update.message.text or "").strip()
+    raw = (update.message.text or "")
+    text = normalize_fa(raw)
     if not text:
         return
+
+    logger.info(f"RX chat={update.effective_chat.id} type={update.effective_chat.type} from={update.effective_user.id} text_raw={raw!r} norm={text!r}")
 
     with Session(engine) as session:
         # Track users/groups
@@ -337,85 +372,93 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ensure_group_member(session, group, user)
             increment_message_count(session, chat, update.effective_user)
 
-        # Dispatch by patterns
+        # Owner panel & PV tools first
+        if PAT_OWNER_PANEL.match(text):
+            await handle_owner_panel(update, context, session, user)
+            return
+        if PAT_GROUP_LIST.match(text):
+            await handle_owner_group_list(update, context, session, user)
+            return
+        if PAT_GROUP_AUTOSHIP_SET.match(text):
+            await handle_owner_group_autoship(update, context, session, user, text)
+            return
+        if PAT_GROUP_REPORT.match(text):
+            await handle_owner_group_report(update, context, session, user, text)
+            return
+        if PAT_SEND_TO_GROUP.match(text):
+            await handle_owner_sendto_group(update, context, session, user, text)
+            return
+
+        # Dispatch by patterns (normalized)
         if PAT_GENDER.match(text):
-            await handle_gender(update, context, session, user)
+            await handle_gender(update, context, session, user, text)
         elif PAT_BDAY.match(text):
-            await handle_birthday(update, context, session, user)
+            await handle_birthday(update, context, session, user, text)
         elif PAT_PROFILE.match(text):
-            await handle_profile(update, context, session, user)
+            await handle_profile(update, context, session, user, text)
         elif PAT_REL_SET.match(text):
-            await handle_rel_set(update, context, session, user)
+            await handle_rel_set(update, context, session, user, text)
         elif PAT_REL_DEL.match(text):
-            await handle_rel_del(update, context, session, user)
+            await handle_rel_del(update, context, session, user, text)
         elif PAT_START_REL.match(text):
-            await handle_start_rel(update, context, session, user)
+            await handle_start_rel(update, context, session, user, text)
         elif PAT_CRUSH.match(text):
-            await handle_crush(update, context, session, user)
+            await handle_crush(update, context, session, user, text)
         elif PAT_SHIPME.match(text):
-            await handle_shipme(update, context, session, user)
+            await handle_shipme(update, context, session, user, text)
         elif PAT_TAGS.match(text):
-            await handle_tags(update, context, session, user)
+            await handle_tags(update, context, session, user, text)
         elif PAT_MYCRUSHES.match(text) or PAT_THEIR.match(text):
-            await handle_crush_lists(update, context, session, user)
+            await handle_crush_lists(update, context, session, user, text)
         elif PAT_CHARGE.match(text):
-            await handle_charge(update, context, session, user)
+            await handle_charge(update, context, session, user, text)
         elif PAT_PANEL.match(text):
-            await handle_panels(update, context, session, user)
+            await handle_panels(update, context, session, user, text)
         elif PAT_HELP.match(text):
             await send_help(update, context)
         elif PAT_CFG.match(text):
-            await handle_configure(update, context, session, user)
+            await handle_configure(update, context, session, user, text)
         elif PAT_AUTOSHIP.match(text):
-            await handle_autoship(update, context, session, user)
+            await handle_autoship(update, context, session, user, text)
         else:
-            # Not a command we care about
             return
 
 # -------------------- Specific feature handlers --------------------
-async def handle_gender(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    text = update.message.text.strip()
+async def handle_gender(update, context, session, actor, text):
     m = PAT_GENDER.match(text)
     val = m.group(1)
     gender = "male" if val == "پسر" else "female"
-
     target_user = actor
     if update.message.reply_to_message:
-        # admin-only when setting for someone else
         if not await is_group_admin(context, update.effective_chat.id, actor.tg_id) and not is_owner(actor.tg_id):
             return await update.message.reply_text("فقط ادمین‌ها می‌تونن برای دیگری ثبت کنند.")
         r = update.message.reply_to_message.from_user
         target_user = get_or_create_user(session, r)
-
     target_user.gender = gender
     session.commit()
     await update.message.reply_html(f"جنسیت برای {hlink_for(target_user)} ثبت شد: <b>{val}</b>")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} جنسیت {hlink_for(target_user)} را «{val}» کرد.")
 
-async def handle_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    text = update.message.text.strip()
+async def handle_birthday(update, context, session, actor, text):
     m = PAT_BDAY.match(text)
     datestr = m.group(1)
     d = parse_date_fa_or_en(datestr)
     if not d:
         return await update.message.reply_text("فرمت تاریخ نامعتبر است. نمونه: 2001-07-23 یا 1380/01/01")
-
     target_user = actor
     if update.message.reply_to_message:
         if not await is_group_admin(context, update.effective_chat.id, actor.tg_id) and not is_owner(actor.tg_id):
             return await update.message.reply_text("فقط ادمین‌ها می‌تونن برای دیگری ثبت کنند.")
         r = update.message.reply_to_message.from_user
         target_user = get_or_create_user(session, r)
-
     target_user.birthday = d
     session.commit()
     await update.message.reply_html(f"تاریخ تولد برای {hlink_for(target_user)} ثبت شد: <b>{fmt_date_fa(d)}</b>")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} تولد {hlink_for(target_user)} را {fmt_date_fa(d)} ثبت کرد.")
 
-async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    text = update.message.text.strip()
+async def handle_profile(update, context, session, actor, text):
     target_user = actor
-    # If username provided explicitly (rare) or reply
     if update.message.reply_to_message:
-        # admin can view others; everyone can view reply target too
         r = update.message.reply_to_message.from_user
         target_user = get_or_create_user(session, r)
     else:
@@ -424,10 +467,7 @@ async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
             cand = session.scalar(select(User).where(func.lower(User.username) == m.group(1).lower()))
             if cand:
                 target_user = cand
-
-    # refresh avatar cache
     await cache_avatar_file_id(context, target_user)
-
     pop = popularity_percent(session, target_user)
     info = [
         f"پروفایل {hlink_for(target_user)}",
@@ -439,23 +479,18 @@ async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
         f"محبوبیت: <b>{pop}%</b>",
     ]
     caption = "\n".join(info)
-
     if target_user.avatar_file_id:
         try:
-            await update.message.reply_photo(
-                photo=target_user.avatar_file_id,
-                caption=caption,
-                parse_mode=ParseMode.HTML
-            )
+            await update.message.reply_photo(photo=target_user.avatar_file_id, caption=caption, parse_mode=ParseMode.HTML)
             return
         except Exception:
             pass
     await update.message.reply_html(caption)
 
-async def handle_rel_set(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_rel_set(update, context, session, actor, text):
     if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌ها می‌تونن رل تعیین کنند.")
-    m = PAT_REL_SET.match(update.message.text.strip())
+    m = PAT_REL_SET.match(text)
     tok1, tok2 = m.group(1), m.group(2)
     u1 = resolve_token_to_user(session, tok1)
     u2 = resolve_token_to_user(session, tok2)
@@ -463,7 +498,6 @@ async def handle_rel_set(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
         return await update.message.reply_text("هر دو طرف باید قبلاً توسط ربات دیده شده باشند (یوزرنیم/آیدی معتبر).")
     if u1.id == u2.id:
         return await update.message.reply_text("طرفین نمی‌تونن یک نفر باشند.")
-    # Ensure order (smaller id first) to respect uniqueness
     a, b = (u1, u2) if u1.id < u2.id else (u2, u1)
     rel = session.scalar(select(Relationship).where(Relationship.user1_id==a.id, Relationship.user2_id==b.id))
     if rel and rel.active:
@@ -477,11 +511,12 @@ async def handle_rel_set(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
             rel.start_date = date.today()
     session.commit()
     await update.message.reply_html(f"رِل ثبت شد بین {hlink_for(u1)} و {hlink_for(u2)} ✨")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} رِل بین {hlink_for(u1)} و {hlink_for(u2)} را ست کرد.")
 
-async def handle_rel_del(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_rel_del(update, context, session, actor, text):
     if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌ها می‌تونن رل رو حذف کنند.")
-    m = PAT_REL_DEL.match(update.message.text.strip())
+    m = PAT_REL_DEL.match(text)
     tok1, tok2 = m.group(1), m.group(2)
     u1 = resolve_token_to_user(session, tok1)
     u2 = resolve_token_to_user(session, tok2)
@@ -494,19 +529,17 @@ async def handle_rel_del(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
     rel.active = False
     session.commit()
     await update.message.reply_html(f"رِل بین {hlink_for(u1)} و {hlink_for(u2)} حذف شد.")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} رِل بین {hlink_for(u1)} و {hlink_for(u2)} را حذف کرد.")
 
-async def handle_start_rel(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    # user for himself (or admin via reply)
-    m = PAT_START_REL.match(update.message.text.strip())
+async def handle_start_rel(update, context, session, actor, text):
+    m = PAT_START_REL.match(text)
     tok = m.group(1)
     d = parse_date_fa_or_en(m.group(2)) if m.group(2) else date.today()
     if update.message.reply_to_message and not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌ها می‌تونن برای دیگری شروع رابطه بزنند.")
-
     partner = resolve_token_to_user(session, tok)
     if not partner:
         return await update.message.reply_text("طرف مقابل باید قبلاً توسط ربات دیده شده باشد (یوزرنیم/آیدی معتبر).")
-    # self must be actor unless admin+reply
     u_self = actor if not update.message.reply_to_message else get_or_create_user(session, update.message.reply_to_message.from_user)
     if u_self.id == partner.id:
         return await update.message.reply_text("با خودت نمی‌تونی رابطه بزنی :)")
@@ -520,15 +553,15 @@ async def handle_start_rel(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         rel.start_date = d
     session.commit()
     await update.message.reply_html(f"شروع رابطه ثبت شد بین {hlink_for(u_self)} و {hlink_for(partner)} در تاریخ <b>{fmt_date_fa(d)}</b> 💞")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} شروع رابطه بین {hlink_for(u_self)} و {hlink_for(partner)} در {fmt_date_fa(d)} را ثبت کرد.")
 
-async def handle_crush(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_crush(update, context, session, actor, text):
     if not update.message.reply_to_message:
         return await update.message.reply_text("باید روی پیام شخص ریپلای کنی.")
     target = get_or_create_user(session, update.message.reply_to_message.from_user)
     if target.id == actor.id:
         return await update.message.reply_text("روی خودت کراش ثبت نمی‌شه :)")
-
-    is_set = "ثبت کراش" in update.message.text
+    is_set = "ثبت کراش" in text
     if is_set:
         ex = session.scalar(select(Crush).where(Crush.from_user_id==actor.id, Crush.to_user_id==target.id))
         if ex:
@@ -537,6 +570,7 @@ async def handle_crush(update: Update, context: ContextTypes.DEFAULT_TYPE, sessi
         session.add(cr)
         session.commit()
         await update.message.reply_html(f"کراش ثبت شد روی {hlink_for(target)} 💘")
+        await notify_owner(context, f"LOG: {hlink_for(actor)} روی {hlink_for(target)} کراش ثبت کرد.")
     else:
         cr = session.scalar(select(Crush).where(Crush.from_user_id==actor.id, Crush.to_user_id==target.id))
         if not cr:
@@ -544,19 +578,16 @@ async def handle_crush(update: Update, context: ContextTypes.DEFAULT_TYPE, sessi
         session.delete(cr)
         session.commit()
         await update.message.reply_html(f"کراش روی {hlink_for(target)} حذف شد.")
+        await notify_owner(context, f"LOG: {hlink_for(actor)} کراش روی {hlink_for(target)} را حذف کرد.")
 
-async def handle_shipme(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_shipme(update, context, session, actor, text):
     chat = update.effective_chat
     if chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
         return await update.message.reply_text("این دستور فقط در گروه کار می‌کند.")
     group = get_or_create_group(session, chat)
-    # find opposite gender
     if actor.gender not in ("male", "female"):
         return await update.message.reply_text("اول جنسیتت رو ثبت کن: «ثبت جنسیت پسر/دختر».")
     opposite = "female" if actor.gender == "male" else "male"
-
-    # members of this group with opposite gender
-    # join GroupMember -> User
     from sqlalchemy import join
     j = join(GroupMember, User, GroupMember.user_id == User.id)
     rows = session.execute(
@@ -566,20 +597,20 @@ async def handle_shipme(update: Update, context: ContextTypes.DEFAULT_TYPE, sess
         return await update.message.reply_text("کسی با جنسیت مناسب در این گروه پیدا نشد.")
     partner = random.choice(rows)
     await update.message.reply_html(f"شیپ شدین: {hlink_for(actor)} ❤️ {hlink_for(partner)}")
+    await notify_owner(context, f"LOG: شیپ در گروه {chat.title or chat.id}: {hlink_for(actor)} و {hlink_for(partner)}.")
 
-async def handle_tags(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_tags(update, context, session, actor, text):
     if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌ها اجازهٔ تگ دارند.")
     if not update.message.reply_to_message:
         return await update.message.reply_text("باید روی یک پیام ریپلای کنی تا تگ ارسال بشه.")
     group = get_or_create_group(session, update.effective_chat)
-    which = PAT_TAGS.match(update.message.text.strip()).group(1)
+    which = PAT_TAGS.match(text).group(1)
     gender_filter = None
     if which == "پسرها":
         gender_filter = "male"
     elif which == "دخترها":
         gender_filter = "female"
-
     from sqlalchemy import join
     j = join(GroupMember, User, GroupMember.user_id == User.id)
     q = select(User).select_from(j).where(GroupMember.group_id==group.id)
@@ -588,16 +619,16 @@ async def handle_tags(update: Update, context: ContextTypes.DEFAULT_TYPE, sessio
     users = session.execute(q).scalars().all()
     if not users:
         return await update.message.reply_text("کسی پیدا نشد.")
-    # Chunk mentions to avoid spam
     CHUNK = 6
     mentions = [hlink_for(u) for u in users]
+    total = 0
     for i in range(0, len(mentions), CHUNK):
         part = " ".join(mentions[i:i+CHUNK])
         await update.message.reply_html(part, disable_web_page_preview=True)
+        total += len(mentions[i:i+CHUNK])
+    await notify_owner(context, f"LOG: {hlink_for(actor)} تگ «{which}» را در گروه {group.title or group.chat_id} ارسال کرد ({total} نفر).")
 
-async def handle_crush_lists(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    text = update.message.text.strip()
-    # my list
+async def handle_crush_lists(update, context, session, actor, text):
     if PAT_MYCRUSHES.match(text):
         rows = session.execute(
             select(User).join(Crush, User.id==Crush.to_user_id).where(Crush.from_user_id==actor.id)
@@ -606,7 +637,6 @@ async def handle_crush_lists(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return await update.message.reply_text("هیچ کراشی ثبت نکردی.")
         msg = "کراش‌هات:\n" + "\n".join([f"• {hlink_for(u)}" for u in rows])
         return await update.message.reply_html(msg)
-    # other's (reply)
     if not update.message.reply_to_message:
         return await update.message.reply_text("برای دیدن لیست دیگری باید روی پیامش ریپلای کنی.")
     target = get_or_create_user(session, update.message.reply_to_message.from_user)
@@ -618,7 +648,7 @@ async def handle_crush_lists(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return await update.message.reply_html(f"{hlink_for(target)} هیچ کراشی ثبت نکرده.")
         msg = f"کراش‌های {hlink_for(target)}:\n" + "\n".join([f"• {hlink_for(u)}" for u in rows])
         return await update.message.reply_html(msg)
-    else:  # کراشرهاش
+    else:
         rows = session.execute(
             select(User).join(Crush, User.id==Crush.from_user_id).where(Crush.to_user_id==target.id)
         ).scalars().all()
@@ -627,8 +657,7 @@ async def handle_crush_lists(update: Update, context: ContextTypes.DEFAULT_TYPE,
         msg = f"کراشرهای {hlink_for(target)}:\n" + "\n".join([f"• {hlink_for(u)}" for u in rows])
         return await update.message.reply_html(msg)
 
-async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    text = update.message.text.strip()
+async def handle_charge(update, context, session, actor, text):
     if not (is_owner(actor.tg_id) or actor.is_seller):
         return await update.message.reply_text("فقط مالک یا فروشنده می‌تواند شارژ کند.")
     m = PAT_CHARGE.match(text)
@@ -637,7 +666,6 @@ async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE, sess
     if update.message.reply_to_message:
         target = get_or_create_user(session, update.message.reply_to_message.from_user)
     else:
-        # optional @username before amount
         m2 = re.search(r"شارژ\s+(@[\w_]+|\d+)\s+\d+$", text)
         if m2:
             target = resolve_token_to_user(session, m2.group(1))
@@ -646,19 +674,18 @@ async def handle_charge(update: Update, context: ContextTypes.DEFAULT_TYPE, sess
     target.snoop_credits += amount
     session.commit()
     await update.message.reply_html(f"برای {hlink_for(target)} شارژ انجام شد: +{amount}")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} برای {hlink_for(target)} {amount} واحد شارژ ثبت کرد.")
 
-async def handle_panels(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    text = update.message.text.strip()
+async def handle_panels(update, context, session, actor, text):
     is_owner_or_seller = is_owner(actor.tg_id) or actor.is_seller
     if "پنل مدیریت" in text:
         if not is_owner_or_seller:
             return await update.message.reply_text("دسترسی نداری.")
-        # simple stats
         total_users = session.scalar(select(func.count(User.id))) or 0
         total_groups = session.scalar(select(func.count(Group.id))) or 0
         total_crushes = session.scalar(select(func.count(Crush.id))) or 0
         total_rel = session.scalar(select(func.count(Relationship.id)).where(Relationship.active==True)) or 0
-        await update.message.reply_html(
+        return await update.message.reply_html(
             f"پنل مدیریت\n"
             f"• کاربران: <b>{total_users}</b>\n"
             f"• گروه‌ها: <b>{total_groups}</b>\n"
@@ -666,20 +693,19 @@ async def handle_panels(update: Update, context: ContextTypes.DEFAULT_TYPE, sess
             f"• رِل‌های فعال: <b>{total_rel}</b>\n"
         )
     else:
-        # پنل اینجا : group-specific
         if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
             return await update.message.reply_text("فقط در گروه.")
         if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner_or_seller):
             return await update.message.reply_text("دسترسی نداری.")
         group = get_or_create_group(session, update.effective_chat)
         members = session.scalar(select(func.count(GroupMember.id)).where(GroupMember.group_id==group.id)) or 0
-        await update.message.reply_html(
+        return await update.message.reply_html(
             f"پنل اینجا ({group.title or group.chat_id})\n"
             f"• اعضای ثبت‌شده: <b>{members}</b>\n"
             f"• شیپ خودکار: <b>{'روشن' if group.auto_ship_enabled else 'خاموش'}</b>\n"
         )
 
-async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_help(update, context):
     msg = (
         "راهنما (دستورات متنی):\n"
         "• ثبت جنسیت پسر|دختر\n"
@@ -694,27 +720,23 @@ async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• (مالک/فروشنده) شارژ [@user] N\n"
         "• پنل مدیریت | پنل اینجا\n"
         "• پیکربندی فضول | به‌روزرسانی مدیران\n"
+        "• (مالک) پنل مالک  ← ابزار کنترل از PV\n"
     )
     await update.message.reply_text(msg)
 
-async def handle_configure(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_configure(update, context, session, actor, text):
     chat = update.effective_chat
     if chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
         return await update.message.reply_text("فقط در گروه.")
-    # Only admins of the group can run (owner bypass)
     if not (await is_group_admin(context, chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌های گروه اجازهٔ پیکربندی دارند.")
-
     group = get_or_create_group(session, chat)
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
     except Exception as e:
         return await update.message.reply_text(f"دریافت مدیران ناموفق: {e}")
-
-    # Reset and store
     session.query(GroupAdmin).filter(GroupAdmin.group_id==group.id).delete()
     session.commit()
-
     stored = []
     for adm in admins:
         tu = adm.user
@@ -723,31 +745,119 @@ async def handle_configure(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         ga = GroupAdmin(group_id=group.id, user_id=u.id, role=role)
         session.add(ga); session.commit()
         stored.append(u)
-
     if not stored:
         return await update.message.reply_text("ادمینی یافت نشد.")
     txt = "مدیران به‌روزرسانی شد:\n" + "\n".join([f"• {hlink_for(u)}" for u in stored])
     await update.message.reply_html(txt)
+    await notify_owner(context, f"LOG: پیکربندی مدیران گروه {group.title or group.chat_id} به‌روزرسانی شد ({len(stored)} مدیر).")
 
-async def handle_autoship(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
+async def handle_autoship(update, context, session, actor, text):
     if update.effective_chat.type not in (ChatType.SUPERGROUP, ChatType.GROUP):
         return await update.message.reply_text("فقط در گروه.")
     if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌های گروه.")
     group = get_or_create_group(session, update.effective_chat)
-    onoff = PAT_AUTOSHIP.match(update.message.text.strip()).group(1) == "روشن"
+    onoff = PAT_AUTOSHIP.match(text).group(1) == "روشن"
     group.auto_ship_enabled = onoff
     session.commit()
     await update.message.reply_html(f"شیپ خودکار: <b>{'روشن' if onoff else 'خاموش'}</b>")
+    await notify_owner(context, f"LOG: {hlink_for(actor)} شیپ خودکار گروه {group.title or group.chat_id} را «{'روشن' if onoff else 'خاموش'}» کرد.")
+
+# -------------------- OWNER PANEL (PV) --------------------
+def _require_owner_pv(update: Update, actor: User) -> Optional[str]:
+    if not is_owner(actor.tg_id):
+        return "فقط مالک."
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return "این دستور فقط در پی‌وی مالک."
+    return None
+
+async def handle_owner_panel(update, context, session, actor):
+    err = _require_owner_pv(update, actor)
+    if err:
+        return await update.message.reply_text(err)
+    msg = (
+        "پنل مالک (PV):\n"
+        "• لیست گروه‌ها\n"
+        "• گروه <chat_id> گزارش\n"
+        "• گروه <chat_id> شیپ خودکار روشن|خاموش\n"
+        "• ارسال گروه <chat_id> <متن>\n"
+        "• افزودن فروشنده @user | حذف فروشنده @user\n"
+        "• رل/حذف رل و سایر دستورات را هم می‌توانی از همین‌جا اجرا کنی.\n"
+        "نکته: chat_id گروه‌های سوپرگروه معمولاً منفی است (مثل -1001234567890)."
+    )
+    await update.message.reply_text(msg)
+
+async def handle_owner_group_list(update, context, session, actor):
+    err = _require_owner_pv(update, actor)
+    if err:
+        return await update.message.reply_text(err)
+    groups = session.execute(select(Group).order_by(Group.last_seen_at.desc())).scalars().all()
+    if not groups:
+        return await update.message.reply_text("هیچ گروهی ثبت نشده.")
+    lines = []
+    for g in groups:
+        lines.append(f"• {g.title or '—'} | id=<code>{g.chat_id}</code> | شیپ خودکار: <b>{'روشن' if g.auto_ship_enabled else 'خاموش'}</b>")
+    await update.message.reply_html("لیست گروه‌ها:\n" + "\n".join(lines), disable_web_page_preview=True)
+
+async def handle_owner_group_autoship(update, context, session, actor, text):
+    err = _require_owner_pv(update, actor)
+    if err:
+        return await update.message.reply_text(err)
+    m = PAT_GROUP_AUTOSHIP_SET.match(text)
+    chat_id = int(m.group(1))
+    onoff = m.group(2) == "روشن"
+    g = session.scalar(select(Group).where(Group.chat_id == chat_id))
+    if not g:
+        return await update.message.reply_text("گروه یافت نشد.")
+    g.auto_ship_enabled = onoff
+    session.commit()
+    await update.message.reply_html(f"شیپ خودکار برای <code>{chat_id}</code>: <b>{'روشن' if onoff else 'خاموش'}</b>")
+    await notify_owner(context, f"LOG: شیپ خودکار گروه {g.title or chat_id} در پنل مالک «{'روشن' if onoff else 'خاموش'}» شد.", html=True)
+
+async def handle_owner_group_report(update, context, session, actor, text):
+    err = _require_owner_pv(update, actor)
+    if err:
+        return await update.message.reply_text(err)
+    m = PAT_GROUP_REPORT.match(text)
+    chat_id = int(m.group(1))
+    g = session.scalar(select(Group).where(Group.chat_id == chat_id))
+    if not g:
+        return await update.message.reply_text("گروه یافت نشد.")
+    members = session.scalar(select(func.count(GroupMember.id)).where(GroupMember.group_id==g.id)) or 0
+    male = session.scalar(
+        select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="male")
+    ) or 0
+    female = session.scalar(
+        select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="female")
+    ) or 0
+    await update.message.reply_html(
+        f"گزارش گروه {g.title or chat_id}\n"
+        f"• اعضای ثبت‌شده: <b>{members}</b>\n"
+        f"• پسر: <b>{male}</b> | دختر: <b>{female}</b>\n"
+        f"• شیپ خودکار: <b>{'روشن' if g.auto_ship_enabled else 'خاموش'}</b>\n"
+        f"• آخرین فعالیت: <code>{g.last_seen_at}</code>"
+    )
+
+async def handle_owner_sendto_group(update, context, session, actor, text):
+    err = _require_owner_pv(update, actor)
+    if err:
+        return await update.message.reply_text(err)
+    m = PAT_SEND_TO_GROUP.match(text)
+    chat_id = int(m.group(1))
+    message = m.group(2)
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message)
+        await update.message.reply_text("ارسال شد.")
+        await notify_owner(context, f"LOG: پیام به گروه {chat_id} ارسال شد.")
+    except Exception as e:
+        await update.message.reply_text(f"ارسال ناموفق: {e}")
 
 # -------------------- Scheduled Jobs --------------------
 async def job_daily_ship(context: ContextTypes.DEFAULT_TYPE):
-    """18:00 Tehran: for each group with auto_ship_enabled, pick a male+female pair random and announce."""
     with Session(engine) as session:
         groups = session.execute(select(Group).where(Group.auto_ship_enabled==True)).scalars().all()
         for g in groups:
             try:
-                # Pick random pair
                 from sqlalchemy import join
                 j = join(GroupMember, User, GroupMember.user_id == User.id)
                 males = session.execute(select(User).select_from(j).where(GroupMember.group_id==g.id, User.gender=="male")).scalars().all()
@@ -758,11 +868,11 @@ async def job_daily_ship(context: ContextTypes.DEFAULT_TYPE):
                 f = random.choice(females)
                 text = f"شیپ روز:\n{hlink_for(m)} ❤️ {hlink_for(f)}"
                 await context.bot.send_message(chat_id=g.chat_id, text=text, parse_mode=ParseMode.HTML)
+                await notify_owner(context, f"LOG: شیپ خودکار در {g.title or g.chat_id}: {hlink_for(m)} ❤️ {hlink_for(f)}")
             except Exception as e:
                 logger.warning(f"auto ship failed for {g.chat_id}: {e}")
 
 async def job_daily_birthdays(context: ContextTypes.DEFAULT_TYPE):
-    """09:00 Tehran: Congratulate users whose birthday is today (by Jalali/Gregorian match of month/day)."""
     today = now_teh().date()
     with Session(engine) as session:
         users = session.execute(select(User).where(User.birthday != None)).scalars().all()
@@ -771,34 +881,26 @@ async def job_daily_birthdays(context: ContextTypes.DEFAULT_TYPE):
             if not b:
                 continue
             if b.month == today.month and b.day == today.day:
-                # Find most active group for this user
                 gm = session.execute(
                     select(GroupMember, Group).join(Group, GroupMember.group_id==Group.id).where(GroupMember.user_id==u.id).order_by(GroupMember.message_count.desc())
                 ).first()
-                target_chat_id = None
-                if gm:
-                    target_chat_id = gm[1].chat_id
+                target_chat_id = gm[1].chat_id if gm else None
                 try:
                     msg = f"تولدت مبارک {hlink_for(u)} 🎉🎂"
                     if target_chat_id:
                         await context.bot.send_message(chat_id=target_chat_id, text=msg, parse_mode=ParseMode.HTML)
                     else:
-                        # Try private
                         await context.bot.send_message(chat_id=u.tg_id, text=msg, parse_mode=ParseMode.HTML)
+                    await notify_owner(context, f"LOG: تبریک تولد برای {hlink_for(u)} ارسال شد.")
                 except Exception as e:
                     logger.warning(f"birthday congratulate failed for {u.tg_id}: {e}")
 
 # -------------------- Application Setup --------------------
 def build_application() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # single message handler (text only)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_any_message))
-
-    # Jobs (JobQueue runs inside run_polling)
     app.job_queue.run_daily(job_daily_ship, time=time(18, 0, tzinfo=TZ))
     app.job_queue.run_daily(job_daily_birthdays, time=time(9, 0, tzinfo=TZ))
-
     return app
 
 def main():
