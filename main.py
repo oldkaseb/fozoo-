@@ -617,18 +617,18 @@ if text in ("ادمین‌ها","ادمین ها","لیست ادمین‌ها","
     admin_text = "👥 ادمین‌ها و مالک:\n" + "\n".join(admin_lines) + "\n" + owner_line
     return await m.reply_html(admin_text)
 
-        # 18) Config
-        if text in ("پیکربندی","پیکربندی فضول"):
-            if not (is_admin or is_owner_of_group):
-                return await m.reply_text("این دستور مخصوص ادمین‌ها و مالک گروه است.")
-            return await open_group_admin_panel(update, context)
+    # 18) Config
+    if text in ("پیکربندی","پیکربندی فضول"):
+        if not (is_admin or is_owner_of_group):
+            return await m.reply_text("این دستور مخصوص ادمین‌ها و مالک گروه است.")
+        return await open_group_admin_panel(update, context)
 
-        # 20) Help
-        if text in ("فضول راهنما","راهنما","کمک","فضول کمک"):
-            privileged = is_admin or is_operator or is_owner_of_group
-            return await show_help(update, context, privileged)
+    # 20) Help
+    if text in ("فضول راهنما","راهنما","کمک","فضول کمک"):
+        privileged = is_admin or is_operator or is_owner_of_group
+        return await show_help(update, context, privileged)
 
-        # 21) Owner/Seller/Admin ops
+    # 21) Owner/Seller/Admin ops
         if text.startswith("فضول شارژ"):
             if not (is_operator or is_admin or is_owner_of_group):
                 return await m.reply_text("اجازه نداری.")
