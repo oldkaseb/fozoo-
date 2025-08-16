@@ -614,10 +614,7 @@ if text in ("ادمین‌ها","ادمین ها","لیست ادمین‌ها","
     owner_line = "— مالک فعلی (DB): نامشخص"
     if g.owner_user_id:
         owner_line = f"— مالک فعلی (DB): <a href=\"tg://user?id={g.owner_user_id}\">{g.owner_user_id}</a>"
-    admin_text = "👥 ادمین‌ها و مالک:
-" + "
-".join(admin_lines) + "
-" + owner_line
+    admin_text = "👥 ادمین‌ها و مالک:\n" + "\n".join(admin_lines) + "\n" + owner_line
     return await m.reply_html(admin_text)
 
         # 18) Config
