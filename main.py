@@ -57,7 +57,6 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
-    AIORateLimiter,
 )
 from telegram.error import BadRequest
 
@@ -454,9 +453,6 @@ async def handle_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
     await update.message.reply_html(caption)
 
 async def handle_rel_set(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
-    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        # Allow in any chat but admin/owner only (owner bypass)
-        pass
     if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
         return await update.message.reply_text("فقط ادمین‌ها می‌تونن رل تعیین کنند.")
     m = PAT_REL_SET.match(update.message.text.strip())
@@ -723,7 +719,7 @@ async def handle_configure(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     for adm in admins:
         tu = adm.user
         u = get_or_create_user(session, tu)
-        role = "creator" if isinstance(adm, ChatMemberOwner) or adm.status=="creator" else "administrator"
+        role = "creator" if isinstance(adm, ChatMemberOwner) or getattr(adm, "status", "")=="creator" else "administrator"
         ga = GroupAdmin(group_id=group.id, user_id=u.id, role=role)
         session.add(ga); session.commit()
         stored.append(u)
@@ -794,35 +790,24 @@ async def job_daily_birthdays(context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Application Setup --------------------
 def build_application() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # single message handler (text only)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_any_message))
 
-    # Jobs
-    # schedule at 18:00 Tehran daily
-    # PTB JobQueue uses UTC by default; we pass tzinfo to run_daily
+    # Jobs (JobQueue runs inside run_polling)
     app.job_queue.run_daily(job_daily_ship, time=time(18, 0, tzinfo=TZ))
     app.job_queue.run_daily(job_daily_birthdays, time=time(9, 0, tzinfo=TZ))
 
     return app
 
-async def main():
+def main():
     app = build_application()
     logger.info("Bot starting with Tehran timezone scheduling.")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    # Idle
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
