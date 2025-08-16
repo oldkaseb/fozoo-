@@ -926,40 +926,55 @@ async def capture_manual_startlove_date(update: Update, context: ContextTypes.DE
 # -------------------- Jobs --------------------
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
-    """09:00 Tehran — birthdays (by Jalali), monthiversaries, low credit alerts"""
+    """09:00 Tehran — birthdays (by Jalali), monthiversaries (by Jalali with clipping), low credit alerts"""
     with SessionLocal() as s:
         groups = s.query(Group).all()
         today_g = dt.datetime.now(TZ_TEHRAN).date()
         today_jy, today_jm, today_jd = g2j(today_g.year, today_g.month, today_g.day)
         soon = dt.datetime.utcnow() + dt.timedelta(days=3)
+
         for g in groups:
-            if not group_active(g): continue
-            # low credit
+            if not group_active(g):
+                continue
+
+            # Low credit warning (< 3 days)
             if g.expires_at and g.expires_at <= soon:
                 try:
-                    await context.bot.send_message(g.id, f"⏳ {owner_mention_html(g.owner_user_id)}اعتبار ربات کمتر از ۳ روز است.", parse_mode=constants.ParseMode.HTML)
-                except Exception: pass
-            # birthdays (compare by Jalali month/day)
+                    await context.bot.send_message(
+                        g.id,
+                        f"⏳ {owner_mention_html(g.owner_user_id)}اعتبار ربات کمتر از ۳ روز است.",
+                        parse_mode=constants.ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+
+            # Birthdays (compare by Jalali month/day)
             users = s.query(User).filter_by(chat_id=g.id).all()
             for u in users:
-                if u.birthday:
-                    jy,jm,jd = g2j(u.birthday.year, u.birthday.month, u.birthday.day)
-                    if jm == today_jm and jd == today_jd:
-                        try:
-                            await context.bot.send_message(g.id, f"🎂 تولدت مبارک {mention_of(u)}! 🌟")
-                        except Exception: pass
-            # monthiversaries (Jalali monthly same-day; clip to month length)
-for r in rels:
-    if r.started_at:
-        sjy, sjm, sjd = g2j(r.started_at.year, r.started_at.month, r.started_at.day)
-        ml = jalali_month_length(today_jy, today_jm)
-        target_day = sjd if sjd <= ml else ml
-        if target_day == today_jd:
-            try:
-                u1 = s.query(User).get(r.user_a_id); u2 = s.query(User).get(r.user_b_id)
-                await context.bot.send_message(g.id, f"💞 ماهگرد {mention_of(u1)} و {mention_of(u2)} مبارک!")
-            except Exception:
-                pass
+                if not u.birthday:
+                    continue
+                jy, jm, jd = g2j(u.birthday.year, u.birthday.month, u.birthday.day)
+                if jm == today_jm and jd == today_jd:
+                    try:
+                        await context.bot.send_message(g.id, f"🎂 تولدت مبارک {mention_of(u)}! 🌟")
+                    except Exception:
+                        pass
+
+            # Monthiversaries (Jalali monthly same-day; clip to month length)
+            rels = s.query(Relationship).filter_by(chat_id=g.id).all()
+            for r in rels:
+                if not r.started_at:
+                    continue
+                sjy, sjm, sjd = g2j(r.started_at.year, r.started_at.month, r.started_at.day)
+                ml = jalali_month_length(today_jy, today_jm)  # length of current Jalali month
+                target_day = sjd if sjd <= ml else ml        # clip 31->30/29 if needed
+                if target_day == today_jd:
+                    try:
+                        u1 = s.get(User, r.user_a_id)
+                        u2 = s.get(User, r.user_b_id)
+                        await context.bot.send_message(g.id, f"💞 ماهگرد {mention_of(u1)} و {mention_of(u2)} مبارک!")
+                    except Exception:
+                        pass
 
 async def job_ship_evening(context: ContextTypes.DEFAULT_TYPE):
     """19:00 Tehran — auto ship between singles"""
