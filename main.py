@@ -387,18 +387,6 @@ def group_remaining_days(session: Session, group: 'Group') -> int:
     diff = (exp - now_teh().date()).days
     return diff if diff > 0 else 0
 
-    if not OWNER_ID: return
-    try:
-        with Session(engine) as s:
-            on = get_cfg(s, "owner_logs", "on") != "off"
-        if not on: return
-        if html:
-            await context.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        else:
-            await context.bot.send_message(chat_id=OWNER_ID, text=text, disable_web_page_preview=True)
-    except Exception as e:
-        logger.warning(f"notify_owner failed: {e}")
-
 # -------------------- Triggers --------------------
 PAT_BDAY = re.compile(r"^ثبت\s*تولد\s+(\d{4}[-/]\d{1,2}[-/]\d{1,2})$")
 PAT_GENDER = re.compile(r"^ثبت\s+جنسیت\s+(پسر|دختر)$")
