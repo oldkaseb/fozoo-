@@ -1201,6 +1201,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
+    if text.strip() in ("راهنما","کمک","help","Help"): return await cmd_help(update, context)
     # Allow 'انتخاب از لیست' to open chooser
     if text.replace("‌","").strip() in ("انتخاب از لیست","انتخاب از ليست","از لیست","از ليست"):
         with SessionLocal() as s2:
