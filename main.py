@@ -1216,14 +1216,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)
 
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if text.startswith("فضول "):
-    t2 = text.split(None, 1)[1] if len(text.split())>1 else ""
+    if text.startswith("فضول"):
+    t2 = text.split(None, 1)[1] if len(text.split())>1 
+    else ""
+    
     if t2 in ("اعتبار","اعتبار گروه"):
         with SessionLocal() as s:
             actor_id = update.effective_user.id
             if not ((OWNER_NOTIFY_TG_ID and actor_id == OWNER_NOTIFY_TG_ID) or _is_seller_for_group(s, actor_id, g.id)):
                 return await m.reply_text("این دستور مخصوص مالک ربات و فروشنده‌هاست.")
             return await m.reply_text(f"⏳ اعتبار گروه: {fmt_dt_fa(g.expires_at)}")
+            
     m_ext = re.match(r"^تمدید\s+(\d+)$", fa_to_en_digits(t2 or ""))
     if m_ext:
         days = int(m_ext.group(1))
