@@ -778,6 +778,8 @@ def user_help_text() -> str:
         "• «کراشام» → لیست کراش‌ها\n"
         "• «ایدی» → پروفایل کامل + محبوبیت\n"
         "• «محبوب امروز»، «شیپم کن»، «شیپ امشب»\n"
+        "• «فضول اعتبار»، «فضول تمدید ۷»، «فضول صفر»، «فضول خروج» (مالک/فروشنده)\n"
+        "• «فضول پاکسازی» (مالک/فروشنده)\n"
     )
 
 
@@ -1215,7 +1217,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-# متنی: فضول اعتبار / فضول تمدید N / فضول صفر / فضول خروج — فقط مالک ربات یا فروشنده
+
 if text.startswith("فضول "):
     t2 = text.split(None, 1)[1] if len(text.split())>1 else ""
     if t2 in ("اعتبار","اعتبار گروه"):
@@ -1302,6 +1304,53 @@ if text in ("ادمین‌ها","ادمین ها","لیست ادمین‌ها","
 
     if update.effective_chat.type not in ("group","supergroup") or not update.message or not update.message.text: return
     text = clean_text(update.message.text)
+    # متنی: فضول اعتبار / فضول تمدید N / فضول صفر / فضول خروج — فقط مالک ربات یا فروشنده
+    if text.startswith("فضول "):
+        t2 = text.split(None, 1)[1] if len(text.split())>1 else ""
+        chat_id = update.effective_chat.id
+        with SessionLocal() as s:
+            g = ensure_group(s, update.effective_chat)
+            actor_id = update.effective_user.id
+            is_power = (OWNER_NOTIFY_TG_ID and actor_id == OWNER_NOTIFY_TG_ID) or _is_seller_for_group(s, actor_id, g.id)
+
+        if t2 in ("اعتبار","اعتبار گروه"):
+            if not is_power:
+                return await m.reply_text("این دستور مخصوص مالک ربات و فروشنده‌هاست.")
+            return await m.reply_text(f"⏳ اعتبار گروه: {fmt_dt_fa(g.expires_at)}")
+
+        m_ext = re.match(r"^تمدید\s+(\d+)$", fa_to_en_digits(t2 or ""))
+        if m_ext:
+            days = int(m_ext.group(1))
+            if not is_power:
+                return await m.reply_text("این دستور مخصوص مالک ربات و فروشنده‌هاست.")
+            with SessionLocal() as s:
+                gg = s.get(Group, chat_id)
+                now = dt.datetime.now(dt.UTC)
+                exp = gg.expires_at.replace(tzinfo=dt.UTC) if (gg.expires_at and gg.expires_at.tzinfo is None) else gg.expires_at
+                base = exp if (exp and exp>now) else now
+                gg.expires_at = base + dt.timedelta(days=days)
+                s.add(SubscriptionLog(chat_id=gg.id, actor_tg_user_id=actor_id, action="extend", amount_days=days)); s.commit()
+            await m.reply_text(f"✅ تمدید شد تا {fmt_dt_fa(gg.expires_at)}")
+            await notify_owner(context, f"[گزارش] گروه <b>{html.escape(g.title or str(g.id))}</b> {fa_digits(days)} روز تمدید شد.", g)
+            return
+
+        if t2 in ("صفر","صفر کردن","صفرکردن"):
+            if not is_power:
+                return await m.reply_text("این دستور مخصوص مالک ربات و فروشنده‌هاست.")
+            with SessionLocal() as s:
+                gg = s.get(Group, chat_id); gg.expires_at = dt.datetime.now(dt.UTC)
+                s.add(SubscriptionLog(chat_id=gg.id, actor_tg_user_id=actor_id, action="zero")); s.commit()
+            return await m.reply_text("⏱ اعتبار صفر شد.")
+
+        if t2 in ("خروج","خارج شو","برو بیرون"):
+            if not is_power:
+                return await m.reply_text("این دستور مخصوص مالک ربات و فروشنده‌هاست.")
+            try:
+                await context.bot.leave_chat(chat_id)
+            except Exception:
+                pass
+            return
+
     if text.strip() in ("راهنما","کمک","help","Help"): return await cmd_help(update, context)
     # Allow 'انتخاب از لیست' to open chooser
     if text.replace("‌","").strip() in ("انتخاب از لیست","انتخاب از ليست","از لیست","از ليست"):
