@@ -748,8 +748,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if action == "ext":
                 days = int(rest[0])
                 now = dt.datetime.now(dt.UTC)
-            exp = g.expires_at.replace(tzinfo=dt.UTC) if (g.expires_at and g.expires_at.tzinfo is None) else g.expires_at
-            base = exp if (exp and exp>now) else now
+                exp = g.expires_at.replace(tzinfo=dt.UTC) if (g.expires_at and g.expires_at.tzinfo is None) else g.expires_at
+                base = exp if (exp and exp>now) else now
                 g.expires_at = base + dt.timedelta(days=days)
                 s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=actor_id, action="extend", amount_days=days)); s.commit()
                 await q.message.edit_text(f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data=f"adm:g:{gid}")],[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
