@@ -175,6 +175,44 @@ def normalize_fa(s: str) -> str:
 def now_teh() -> datetime:
     return datetime.now(TZ)
 
+
+def _jalali_to_gregorian(y: int, m: int, d: int) -> tuple[int, int, int]:
+    # Fallback converter based on JDN algorithm (jalaali-js)
+    jy = y - 979
+    days = 365 * jy + (jy // 33) * 8 + ((jy % 33) + 3) // 4 + d
+    if m < 7:
+        days += (m - 1) * 31
+    else:
+        days += (m - 7) * 30 + 186
+    days += 79  # shift to Gregorian base
+
+    gy = 1600 + 400 * (days // 146097)
+    days %= 146097
+    leap = True
+    if days >= 36525:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+        else:
+            leap = False
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days >= 366:
+        leap = False
+        days -= 1
+        gy += days // 365
+        days %= 365
+    gd = days + 1
+    g_months = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 0
+    while gm < 12 and gd > g_months[gm]:
+        gd -= g_months[gm]
+        gm += 1
+    return gy, gm + 1, gd
+
+
 def parse_date_fa_or_en(s: str) -> Optional[date]:
     s = normalize_fa(s or "")
     try:
@@ -182,9 +220,15 @@ def parse_date_fa_or_en(s: str) -> Optional[date]:
         if len(parts) != 3:
             return None
         y, m, d = map(int, parts)
-        if HAS_PTOOLS and y < 1700:
-            g = JalaliDate(y, m, d).to_gregorian()
-            return date(g.year, g.month, g.day)
+        # Heuristic: years < 1700 are assumed to be Jalali (e.g., 1377/06/08, 1404-02-22)
+        if y < 1700:
+            if HAS_PTOOLS:
+                g = JalaliDate(y, m, d).to_gregorian()
+                return date(g.year, g.month, g.day)
+            else:
+                gy, gm, gd = _jalali_to_gregorian(y, m, d)
+                return date(gy, gm, gd)
+        # Otherwise treat as Gregorian
         return date(y, m, d)
     except Exception as e:
         logger.warning(f"parse_date failed for {s!r}: {e}")
