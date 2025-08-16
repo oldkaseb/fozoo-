@@ -42,6 +42,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 from telegram import (
     Update,
     ChatMemberOwner,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
@@ -49,6 +51,7 @@ from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 from telegram.error import BadRequest
@@ -329,11 +332,12 @@ async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str, html: bool
 
 # -------------------- Triggers --------------------
 PAT_GENDER = re.compile(r"^ثبت\s+جنسیت\s+(پسر|دختر)$")
-PAT_BDAY = re.compile(r"^ثبت\s+تولد\s+(\d{4}[-/]\d{2}[-/]\d{2})$")
-PAT_PROFILE = re.compile(r"^(نمایش\s+اطلاعات|آیدی|نمایش\s+پروفایل)(?:\s+@[\w_]+)?$")
+PAT_BDAY = re.compile(r"^ثبت\s+تولد\s+(\d{4}[-/]\d{1,2}[-/]\d{1,2})$")  # relaxed
+PAT_PROFILE = re.compile(r"^(نمایش\s+اطلاعات|نمایش\s+پروفایل)(?:\s+@[\w_]+)?$")
+PAT_IDONLY = re.compile(r"^آیدی(?:\s+آیدی)?(?:\s+(@[\w_]+|\d+))?$")  # id or id id
 PAT_REL_SET = re.compile(r"^(@[\w_]+|\d+)\s+رل\s+(@[\w_]+|\d+)$")
 PAT_REL_DEL = re.compile(r"^(@[\w_]+|\d+)\s+حذف\s+رل\s+(@[\w_]+|\d+)$")
-PAT_START_REL = re.compile(r"^شروع\s+رابطه\s+(@[\w_]+|\d+)(?:\s+(\d{4}[-/]\d{2}[-/]\d{2}))?$")
+PAT_START_REL = re.compile(r"^شروع\s+رابطه(?:\s+(@[\w_]+|\d+))?(?:\s+(\d{4}[-/]\d{1,2}[-/]\d{1,2}))?$")  # username optional
 PAT_CRUSH = re.compile(r"^(ثبت\s+کراش|حذف\s+کراش)$")
 PAT_SHIPME = re.compile(r"^شیپم\s+کن$")
 PAT_TAGS = re.compile(r"^تگ\s+(پسرها|دخترها|همه)$")
@@ -345,7 +349,7 @@ PAT_OWNER_PANEL = re.compile(r"^پنل\s+مالک$")
 PAT_HELP = re.compile(r"^راهنما$")
 PAT_CFG = re.compile(r"^(پیکربندی\s+فضول|به‌روزرسانی\s+مدیران)$")
 PAT_AUTOSHIP = re.compile(r"^شیپ\s+خودکار\s+(روشن|خاموش)$")
-# Owner PV tools
+# Owner PV tools (also via inline)
 PAT_GROUP_LIST = re.compile(r"^لیست\s+گروه‌ها$")
 PAT_GROUP_AUTOSHIP_SET = re.compile(r"^گروه\s+(-?\d+)\s+شیپ\s+خودکار\s+(روشن|خاموش)$")
 PAT_GROUP_REPORT = re.compile(r"^گروه\s+(-?\d+)\s+گزارش$")
@@ -372,7 +376,18 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ensure_group_member(session, group, user)
             increment_message_count(session, chat, update.effective_user)
 
-        # Owner panel & PV tools first
+        # Owner send-to-group typing mode
+        if is_owner(user.tg_id) and context.user_data.get("send_to_chat_id"):
+            target_chat = int(context.user_data.pop("send_to_chat_id"))
+            try:
+                await context.bot.send_message(chat_id=target_chat, text=raw)
+                await update.message.reply_text("ارسال شد.")
+                await notify_owner(context, f"LOG: پیام به گروه {target_chat} ارسال شد (از پنل مالک).")
+            except Exception as e:
+                await update.message.reply_text(f"ارسال ناموفق: {e}")
+            return
+
+        # Owner panel & PV tools first (now allowed anywhere for owner)
         if PAT_OWNER_PANEL.match(text):
             await handle_owner_panel(update, context, session, user)
             return
@@ -394,6 +409,8 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_gender(update, context, session, user, text)
         elif PAT_BDAY.match(text):
             await handle_birthday(update, context, session, user, text)
+        elif PAT_IDONLY.match(text):
+            await handle_id_only(update, context, session, user, text)
         elif PAT_PROFILE.match(text):
             await handle_profile(update, context, session, user, text)
         elif PAT_REL_SET.match(text):
@@ -455,6 +472,17 @@ async def handle_birthday(update, context, session, actor, text):
     session.commit()
     await update.message.reply_html(f"تاریخ تولد برای {hlink_for(target_user)} ثبت شد: <b>{fmt_date_fa(d)}</b>")
     await notify_owner(context, f"LOG: {hlink_for(actor)} تولد {hlink_for(target_user)} را {fmt_date_fa(d)} ثبت کرد.")
+
+async def handle_id_only(update, context, session, actor, text):
+    target = actor
+    m = PAT_IDONLY.match(text)
+    if update.message.reply_to_message:
+        target = get_or_create_user(session, update.message.reply_to_message.from_user)
+    elif m and m.group(1):
+        cand = resolve_token_to_user(session, m.group(1))
+        if cand:
+            target = cand
+    await update.message.reply_html(f"آیدی عددی {hlink_for(target)}: <code>{target.tg_id}</code>")
 
 async def handle_profile(update, context, session, actor, text):
     target_user = actor
@@ -535,11 +563,14 @@ async def handle_start_rel(update, context, session, actor, text):
     m = PAT_START_REL.match(text)
     tok = m.group(1)
     d = parse_date_fa_or_en(m.group(2)) if m.group(2) else date.today()
-    if update.message.reply_to_message and not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
-        return await update.message.reply_text("فقط ادمین‌ها می‌تونن برای دیگری شروع رابطه بزنند.")
-    partner = resolve_token_to_user(session, tok)
-    if not partner:
-        return await update.message.reply_text("طرف مقابل باید قبلاً توسط ربات دیده شده باشد (یوزرنیم/آیدی معتبر).")
+    if tok:
+        partner = resolve_token_to_user(session, tok)
+        if not partner:
+            return await update.message.reply_text("طرف مقابل باید قبلاً توسط ربات دیده شده باشد (یوزرنیم/آیدی معتبر).")
+    else:
+        if not update.message.reply_to_message:
+            return await update.message.reply_text("برای شروع رابطه بدون یوزرنیم، باید روی پیام طرف مقابل ریپلای کنی.")
+        partner = get_or_create_user(session, update.message.reply_to_message.from_user)
     u_self = actor if not update.message.reply_to_message else get_or_create_user(session, update.message.reply_to_message.from_user)
     if u_self.id == partner.id:
         return await update.message.reply_text("با خودت نمی‌تونی رابطه بزنی :)")
@@ -709,18 +740,17 @@ async def send_help(update, context):
     msg = (
         "راهنما (دستورات متنی):\n"
         "• ثبت جنسیت پسر|دختر\n"
-        "• ثبت تولد YYYY-MM-DD یا YYYY/MM/DD (شمسی/میلادی)\n"
-        "• نمایش اطلاعات | آیدی | نمایش پروفایل\n"
-        "• شروع رابطه @partner [تاریخ]\n"
+        "• ثبت تولد YYYY-MM-DD یا YYYY/M/D (شمسی/میلادی)\n"
+        "• نمایش اطلاعات | نمایش پروفایل | آیدی | آیدی آیدی\n"
+        "• شروع رابطه [@partner] [تاریخ]  ← بدون یوزرنیم با ریپلای\n"
         "• ثبت کراش / حذف کراش (فقط با ریپلای)\n"
         "• شیپم کن (گروه)\n"
         "• کراشام | (با ریپلای) کراشاش / کراشرهاش\n"
         "• (ادمین/مالک) @a رل @b | @a حذف رل @b\n"
         "• (ادمین/مالک) تگ پسرها | تگ دخترها | تگ همه (با ریپلای)\n"
         "• (مالک/فروشنده) شارژ [@user] N\n"
-        "• پنل مدیریت | پنل اینجا\n"
+        "• پنل مدیریت | پنل اینجا | پنل مالک\n"
         "• پیکربندی فضول | به‌روزرسانی مدیران\n"
-        "• (مالک) پنل مالک  ← ابزار کنترل از PV\n"
     )
     await update.message.reply_text(msg)
 
@@ -763,46 +793,135 @@ async def handle_autoship(update, context, session, actor, text):
     await update.message.reply_html(f"شیپ خودکار: <b>{'روشن' if onoff else 'خاموش'}</b>")
     await notify_owner(context, f"LOG: {hlink_for(actor)} شیپ خودکار گروه {group.title or group.chat_id} را «{'روشن' if onoff else 'خاموش'}» کرد.")
 
-# -------------------- OWNER PANEL (PV) --------------------
-def _require_owner_pv(update: Update, actor: User) -> Optional[str]:
+# -------------------- OWNER PANEL (Inline Keyboard) --------------------
+def owner_menu_markup(page: int = 0, session: Optional[Session] = None) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("↻ تازه‌سازی", callback_data="op:home")],
+        [InlineKeyboardButton("📋 لیست گروه‌ها", callback_data=f"op:gl:{page}")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+async def handle_owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session, actor: User):
     if not is_owner(actor.tg_id):
-        return "فقط مالک."
-    if update.effective_chat.type != ChatType.PRIVATE:
-        return "این دستور فقط در پی‌وی مالک."
-    return None
+        return await update.message.reply_text("فقط مالک.")
+    text = "پنل مالک — دکمه‌ها را انتخاب کنید."
+    await update.message.reply_text(text, reply_markup=owner_menu_markup(0, session))
 
-async def handle_owner_panel(update, context, session, actor):
-    err = _require_owner_pv(update, actor)
-    if err:
-        return await update.message.reply_text(err)
-    msg = (
-        "پنل مالک (PV):\n"
-        "• لیست گروه‌ها\n"
-        "• گروه <chat_id> گزارش\n"
-        "• گروه <chat_id> شیپ خودکار روشن|خاموش\n"
-        "• ارسال گروه <chat_id> <متن>\n"
-        "• افزودن فروشنده @user | حذف فروشنده @user\n"
-        "• رل/حذف رل و سایر دستورات را هم می‌توانی از همین‌جا اجرا کنی.\n"
-        "نکته: chat_id گروه‌های سوپرگروه معمولاً منفی است (مثل -1001234567890)."
-    )
-    await update.message.reply_text(msg)
-
-async def handle_owner_group_list(update, context, session, actor):
-    err = _require_owner_pv(update, actor)
-    if err:
-        return await update.message.reply_text(err)
+async def render_group_list(update_or_query, context: ContextTypes.DEFAULT_TYPE, session: Session, page: int):
+    PER_PAGE = 5
     groups = session.execute(select(Group).order_by(Group.last_seen_at.desc())).scalars().all()
-    if not groups:
-        return await update.message.reply_text("هیچ گروهی ثبت نشده.")
-    lines = []
-    for g in groups:
-        lines.append(f"• {g.title or '—'} | id=<code>{g.chat_id}</code> | شیپ خودکار: <b>{'روشن' if g.auto_ship_enabled else 'خاموش'}</b>")
-    await update.message.reply_html("لیست گروه‌ها:\n" + "\n".join(lines), disable_web_page_preview=True)
+    total = len(groups)
+    start = page * PER_PAGE
+    end = min(start + PER_PAGE, total)
+    page_groups = groups[start:end]
+    lines = [f"📋 لیست گروه‌ها (صفحه {page+1}/{max(1,(total+PER_PAGE-1)//PER_PAGE)}):"]
+    kb: List[List[InlineKeyboardButton]] = []
+    for g in page_groups:
+        status = "روشن" if g.auto_ship_enabled else "خاموش"
+        lines.append(f"• {g.title or '—'} | <code>{g.chat_id}</code> | شیپ: <b>{status}</b>")
+        kb.append([
+            InlineKeyboardButton("گزارش", callback_data=f"op:gr:{g.chat_id}:{page}"),
+            InlineKeyboardButton(f"شیپ:{'خاموش' if g.auto_ship_enabled else 'روشن'}", callback_data=f"op:gtoggle:{g.chat_id}:{page}"),
+        ])
+        kb.append([
+            InlineKeyboardButton("به‌روزرسانی مدیران", callback_data=f"op:syncadmins:{g.chat_id}:{page}"),
+            InlineKeyboardButton("ارسال پیام…", callback_data=f"op:asksend:{g.chat_id}:{page}"),
+        ])
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"op:gl:{page-1}"))
+    nav.append(InlineKeyboardButton("خانه", callback_data="op:home"))
+    if end < total:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"op:gl:{page+1}"))
+    kb.append(nav)
+    text = "\n".join(lines)
+    if isinstance(update_or_query, Update):
+        await update_or_query.message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update_or_query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
+
+async def handle_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    with Session(engine) as session:
+        user = get_or_create_user(session, query.from_user)
+        if not is_owner(user.tg_id):
+            return await query.edit_message_text("فقط مالک.")
+        parts = data.split(":")
+        op = parts[1] if len(parts) > 1 else ""
+        if op == "home":
+            return await query.edit_message_text("پنل مالک — دکمه‌ها را انتخاب کنید.", reply_markup=owner_menu_markup(0, session))
+        if op == "gl":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            return await render_group_list(query, context, session, page)
+        if op == "gr":
+            chat_id = int(parts[2]); page = int(parts[3]) if len(parts) > 3 else 0
+            g = session.scalar(select(Group).where(Group.chat_id==chat_id))
+            if not g:
+                return await query.edit_message_text("گروه یافت نشد.")
+            members = session.scalar(select(func.count(GroupMember.id)).where(GroupMember.group_id==g.id)) or 0
+            male = session.scalar(select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="male")) or 0
+            female = session.scalar(select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="female")) or 0
+            text = (
+                f"گزارش گروه {g.title or chat_id}\n"
+                f"• اعضای ثبت‌شده: <b>{members}</b>\n"
+                f"• پسر: <b>{male}</b> | دختر: <b>{female}</b>\n"
+                f"• شیپ خودکار: <b>{'روشن' if g.auto_ship_enabled else 'خاموش'}</b>\n"
+                f"• آخرین فعالیت: <code>{g.last_seen_at}</code>"
+            )
+            kb = [[
+                InlineKeyboardButton("بازگشت به لیست", callback_data=f"op:gl:{page}"),
+                InlineKeyboardButton(f"شیپ:{'خاموش' if g.auto_ship_enabled else 'روشن'}", callback_data=f"op:gtoggle:{chat_id}:{page}")
+            ]]
+            return await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        if op == "gtoggle":
+            chat_id = int(parts[2]); page = int(parts[3]) if len(parts) > 3 else 0
+            g = session.scalar(select(Group).where(Group.chat_id==chat_id))
+            if not g:
+                return await query.edit_message_text("گروه یافت نشد.")
+            g.auto_ship_enabled = not g.auto_ship_enabled
+            session.commit()
+            await notify_owner(context, f"LOG: شیپ خودکار گروه {g.title or chat_id} {'روشن' if g.auto_ship_enabled else 'خاموش'} شد.")
+            return await render_group_list(query, context, session, page)
+        if op == "syncadmins":
+            chat_id = int(parts[2]); page = int(parts[3]) if len(parts) > 3 else 0
+            try:
+                admins = await context.bot.get_chat_administrators(chat_id)
+            except Exception as e:
+                return await query.edit_message_text(f"دریافت مدیران ناموفق: {e}")
+            group = session.scalar(select(Group).where(Group.chat_id==chat_id))
+            if not group:
+                return await query.edit_message_text("گروه ثبت نشده.")
+            session.query(GroupAdmin).filter(GroupAdmin.group_id==group.id).delete()
+            session.commit()
+            stored = []
+            for adm in admins:
+                tu = adm.user
+                u = get_or_create_user(session, tu)
+                role = "creator" if getattr(adm, 'status', '') == 'creator' else 'administrator'
+                session.add(GroupAdmin(group_id=group.id, user_id=u.id, role=role))
+                session.commit()
+                stored.append(u)
+            await notify_owner(context, f"LOG: پیکربندی مدیران گروه {group.title or chat_id} به‌روزرسانی شد ({len(stored)} مدیر).")
+            return await render_group_list(query, context, session, page)
+        if op == "asksend":
+            chat_id = int(parts[2]); page = int(parts[3]) if len(parts) > 3 else 0
+            context.user_data["send_to_chat_id"] = chat_id
+            kb = [[InlineKeyboardButton("بازگشت", callback_data=f"op:gl:{page}")]]
+            return await query.edit_message_text(f"پیام خود را بفرست تا به گروه <code>{chat_id}</code> ارسال شود.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
+# Owner textual tools
+async def handle_owner_group_list(update, context, session, actor):
+    if not is_owner(actor.tg_id):
+        return await update.message.reply_text("فقط مالک.")
+    return await render_group_list(update, context, session, 0)
 
 async def handle_owner_group_autoship(update, context, session, actor, text):
-    err = _require_owner_pv(update, actor)
-    if err:
-        return await update.message.reply_text(err)
+    if not is_owner(actor.tg_id):
+        return await update.message.reply_text("فقط مالک.")
     m = PAT_GROUP_AUTOSHIP_SET.match(text)
     chat_id = int(m.group(1))
     onoff = m.group(2) == "روشن"
@@ -815,21 +934,16 @@ async def handle_owner_group_autoship(update, context, session, actor, text):
     await notify_owner(context, f"LOG: شیپ خودکار گروه {g.title or chat_id} در پنل مالک «{'روشن' if onoff else 'خاموش'}» شد.", html=True)
 
 async def handle_owner_group_report(update, context, session, actor, text):
-    err = _require_owner_pv(update, actor)
-    if err:
-        return await update.message.reply_text(err)
+    if not is_owner(actor.tg_id):
+        return await update.message.reply_text("فقط مالک.")
     m = PAT_GROUP_REPORT.match(text)
     chat_id = int(m.group(1))
     g = session.scalar(select(Group).where(Group.chat_id == chat_id))
     if not g:
         return await update.message.reply_text("گروه یافت نشد.")
     members = session.scalar(select(func.count(GroupMember.id)).where(GroupMember.group_id==g.id)) or 0
-    male = session.scalar(
-        select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="male")
-    ) or 0
-    female = session.scalar(
-        select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="female")
-    ) or 0
+    male = session.scalar(select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="male")) or 0
+    female = session.scalar(select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="female")) or 0
     await update.message.reply_html(
         f"گزارش گروه {g.title or chat_id}\n"
         f"• اعضای ثبت‌شده: <b>{members}</b>\n"
@@ -839,9 +953,8 @@ async def handle_owner_group_report(update, context, session, actor, text):
     )
 
 async def handle_owner_sendto_group(update, context, session, actor, text):
-    err = _require_owner_pv(update, actor)
-    if err:
-        return await update.message.reply_text(err)
+    if not is_owner(actor.tg_id):
+        return await update.message.reply_text("فقط مالک.")
     m = PAT_SEND_TO_GROUP.match(text)
     chat_id = int(m.group(1))
     message = m.group(2)
@@ -899,6 +1012,7 @@ async def job_daily_birthdays(context: ContextTypes.DEFAULT_TYPE):
 def build_application() -> Application:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_any_message))
+    app.add_handler(CallbackQueryHandler(handle_owner_callback, pattern=r"^op:"))
     app.job_queue.run_daily(job_daily_ship, time=time(18, 0, tzinfo=TZ))
     app.job_queue.run_daily(job_daily_birthdays, time=time(9, 0, tzinfo=TZ))
     return app
