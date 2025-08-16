@@ -597,109 +597,110 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await m.reply_to_message.reply_text(" ".join(tags))
 
         
-# لیست ادمین‌ها (متنی) — فقط ادمین/مالک/اپراتور
-if text in ("ادمین‌ها","ادمین ها","لیست ادمین‌ها","ادمین های گروه"):
-    if not (is_admin or is_owner_of_group or is_operator):
-        return await m.reply_text("این دستور مخصوص ادمین‌ها و مالک گروه است.")
-    admin_lines = []
-    try:
-        admins = await context.bot.get_chat_administrators(g.id)
-        for a in admins:
-            uu = a.user
-            role = "سازنده" if getattr(a, "status", "") == "creator" else "ادمین"
-            nm = html.escape(uu.first_name or str(uu.id))
-            admin_lines.append(f"- {role}: <a href=\"tg://user?id={uu.id}\">{nm}</a> @{uu.username or ''}")
-    except Exception:
-        admin_lines.append("⚠️ برای دیدن فهرست ادمین‌ها، ربات باید ادمین گروه باشد.")
-    owner_line = "— مالک فعلی (DB): نامشخص"
-    if g.owner_user_id:
-        owner_line = f"— مالک فعلی (DB): <a href=\"tg://user?id={g.owner_user_id}\">{g.owner_user_id}</a>"
-    admin_text = "👥 ادمین‌ها و مالک:\n" + "\n".join(admin_lines) + "\n" + owner_line
-    return await m.reply_html(admin_text)
+        # لیست ادمین‌ها (متنی) — فقط ادمین/مالک/اپراتور
+        if text in ("ادمین‌ها","ادمین ها","لیست ادمین‌ها","ادمین های گروه"):
+            if not (is_admin or is_owner_of_group or is_operator):
+                return await m.reply_text("این دستور مخصوص ادمین‌ها و مالک گروه است.")
+            admin_lines = []
+            try:
+                admins = await context.bot.get_chat_administrators(g.id)
+                for a in admins:
+                    uu = a.user
+                    role = "سازنده" if getattr(a, "status", "") == "creator" else "ادمین"
+                    nm = html.escape(uu.first_name or str(uu.id))
+                    admin_lines.append(f"- {role}: <a href=\"tg://user?id={uu.id}\">{nm}</a> @{uu.username or ''}")
+            except Exception:
+                admin_lines.append("⚠️ برای دیدن فهرست ادمین‌ها، ربات باید ادمین گروه باشد.")
+            owner_line = "— مالک فعلی (DB): نامشخص"
+            if g.owner_user_id:
+                owner_line = f"— مالک فعلی (DB): <a href=\"tg://user?id={g.owner_user_id}\">{g.owner_user_id}</a>"
+            admin_text = "👥 ادمین‌ها و مالک:\n" + "\n".join(admin_lines) + "\n" + owner_line
+            return await m.reply_html(admin_text)
 
-    # 18) Config
-    if text in ("پیکربندی","پیکربندی فضول"):
-        if not (is_admin or is_owner_of_group):
-            return await m.reply_text("این دستور مخصوص ادمین‌ها و مالک گروه است.")
-        return await open_group_admin_panel(update, context)
+            # 18) Config
+            if text in ("پیکربندی","پیکربندی فضول"):
+                if not (is_admin or is_owner_of_group):
+                    return await m.reply_text("این دستور مخصوص ادمین‌ها و مالک گروه است.")
+                return await open_group_admin_panel(update, context)
 
-    # 20) Help
-    if text in ("فضول راهنما","راهنما","کمک","فضول کمک"):
-        privileged = is_admin or is_operator or is_owner_of_group
-        return await show_help(update, context, privileged)
+            # 20) Help
+            if text in ("فضول راهنما","راهنما","کمک","فضول کمک"):
+                privileged = is_admin or is_operator or is_owner_of_group
+                return await show_help(update, context, privileged)
 
-    # 21) Owner/Seller/Admin ops
-        if text.startswith("فضول شارژ"):
-            if not (is_operator or is_admin or is_owner_of_group):
-                return await m.reply_text("اجازه نداری.")
-            mchg = re.match(r"^فضول\s*شارژ\s+(\d+)$", fa_to_en_digits(text))
-            if not mchg: return await m.reply_text("مثال: فضول شارژ 1")
-            days = int(mchg.group(1))
-            now = dt.datetime.now(dt.UTC)
-            exp = g.expires_at.replace(tzinfo=dt.UTC) if (g.expires_at and g.expires_at.tzinfo is None) else g.expires_at
-            base = exp if (exp and exp>now) else now
-            g.expires_at = base + dt.timedelta(days=days)
-            s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user.id, action="extend", amount_days=days)); s.commit()
-            await m.reply_text(f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}")
-            await notify_owner(context, f"[گزارش] فروشنده/ادمین <a href=\"tg://user?id={user.id}\">{user.id}</a> گروه <b>{html.escape(g.title or str(g.id))}</b> را به مقدار {fa_digits(days)} روز شارژ کرد.", g)
-            return
+            # 21) Owner/Seller/Admin ops
+                if text.startswith("فضول شارژ"):
+                    if not (is_operator or is_admin or is_owner_of_group):
+                        return await m.reply_text("اجازه نداری.")
+                    mchg = re.match(r"^فضول\s*شارژ\s+(\d+)$", fa_to_en_digits(text))
+                    if not mchg: return await m.reply_text("مثال: فضول شارژ 1")
+                    days = int(mchg.group(1))
+                    now = dt.datetime.now(dt.UTC)
+                    exp = g.expires_at.replace(tzinfo=dt.UTC) if (g.expires_at and g.expires_at.tzinfo is None) else g.expires_at
+                    base = exp if (exp and exp>now) else now
+                    g.expires_at = base + dt.timedelta(days=days)
+                    s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user.id, action="extend", amount_days=days)); s.commit()
+                    await m.reply_text(f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}")
+                    await notify_owner(context, f"[گزارش] فروشنده/ادمین <a href=\"tg://user?id={user.id}\">{user.id}</a> گروه <b>{html.escape(g.title or str(g.id))}</b> را به مقدار {fa_digits(days)} روز شارژ کرد.", g)
+                    return
 
-        if text in ("صفر کردن اعتبار","صفرکردن اعتبار"):
-            if not (is_operator or is_admin or is_owner_of_group):
-                return await m.reply_text("اجازه نداری.")
-            g.expires_at = dt.datetime.now(dt.UTC)
-            s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user.id, action="zero")); s.commit()
-            await m.reply_text("⏱ اعتبار صفر شد.")
-            await notify_owner(context, f"[گزارش] اعتبار گروه <b>{html.escape(g.title or str(g.id))}</b> توسط <a href=\"tg://user?id={user.id}\">{user.id}</a> صفر شد.", g)
-            return
+                if text in ("صفر کردن اعتبار","صفرکردن اعتبار"):
+                    if not (is_operator or is_admin or is_owner_of_group):
+                        return await m.reply_text("اجازه نداری.")
+                    g.expires_at = dt.datetime.now(dt.UTC)
+                    s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user.id, action="zero")); s.commit()
+                    await m.reply_text("⏱ اعتبار صفر شد.")
+                    await notify_owner(context, f"[گزارش] اعتبار گروه <b>{html.escape(g.title or str(g.id))}</b> توسط <a href=\"tg://user?id={user.id}\">{user.id}</a> صفر شد.", g)
+                    return
 
-        if text == "خروج فضول":
-            if not (is_operator or is_admin or is_owner_of_group):
-                return await m.reply_text("اجازه نداری.")
-            await m.reply_text("خدافظ فضولا 👋")
-            try: await context.bot.leave_chat(g.id)
-            except Exception: pass
-            try: s.query(Group).filter_by(id=g.id).delete(synchronize_session=False); s.commit()
-            except Exception: pass
-            return
+                if text == "خروج فضول":
+                    if not (is_operator or is_admin or is_owner_of_group):
+                        return await m.reply_text("اجازه نداری.")
+                    await m.reply_text("خدافظ فضولا 👋")
+                    try: await context.bot.leave_chat(g.id)
+                    except Exception: pass
+                    try: s.query(Group).filter_by(id=g.id).delete(synchronize_session=False); s.commit()
+                    except Exception: pass
+                    return
 
-        if text == "اعتبار فضول":
-            if not (is_operator or is_admin or is_owner_of_group):
-                return await m.reply_text("اجازه نداری.")
-            return await m.reply_text(f"⏳ اعتبار فعلی: {fmt_dt_fa(g.expires_at)}")
+                if text == "اعتبار فضول":
+                    if not (is_operator or is_admin or is_owner_of_group):
+                        return await m.reply_text("اجازه نداری.")
+                    return await m.reply_text(f"⏳ اعتبار فعلی: {fmt_dt_fa(g.expires_at)}")
 
-        if text == "فضول":
-            return await m.reply_text(random.choice(FAZOL_REPLIES))
+                if text == "فضول":
+                    return await m.reply_text(random.choice(FAZOL_REPLIES))
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q:
-if data == "ga:admins":
-    g = None
-    with SessionLocal() as s:
-        g = s.get(Group, q.message.chat.id) if q.message and q.message.chat else None
-    admin_lines = []
-    try:
-        admins = await context.bot.get_chat_administrators(q.message.chat.id)
-        for a in admins:
-            u = a.user
-            role = "سازنده" if getattr(a, "status", "") == "creator" else "ادمین"
-            nm = html.escape(u.first_name or str(u.id))
-            admin_lines.append(f"- {role}: <a href=\"tg://user?id={u.id}\">{nm}</a> @{u.username or ''}")
-    except Exception:
-        admin_lines.append("⚠️ برای دیدن فهرست ادمین‌ها، ربات باید ادمین گروه باشد.")
-    owner_line = "— مالک فعلی (DB): نامشخص"
-    if g and g.owner_user_id:
-        owner_line = f"— مالک فعلی (DB): <a href=\"tg://user?id={g.owner_user_id}\">{g.owner_user_id}</a>"
-    txt = "👥 ادمین‌ها و مالک:\n" + "\n".join(admin_lines) + "\n" + owner_line
-    try:
-        await q.message.edit_text(txt, parse_mode=constants.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="help:home")],[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
-    except Exception:
-        pass
-    return
- CallbackQuery = update.callback_query
-    await q.answer()
+    q = update.callback_query
+    if not q:
+        return
     data = q.data or ""
+    if data == "ga:admins":
+        g = None
+        with SessionLocal() as s:
+            g = s.get(Group, q.message.chat.id) if q.message and q.message.chat else None
+        admin_lines = []
+        try:
+            admins = await context.bot.get_chat_administrators(q.message.chat.id)
+            for a in admins:
+                u = a.user
+                role = "سازنده" if getattr(a, "status", "") == "creator" else "ادمین"
+                nm = html.escape(u.first_name or str(u.id))
+                admin_lines.append(f"- {role}: <a href=\"tg://user?id={u.id}\">{nm}</a> @{u.username or ''}")
+        except Exception:
+            admin_lines.append("⚠️ برای دیدن فهرست ادمین‌ها، ربات باید ادمین گروه باشد.")
+        owner_line = "— مالک فعلی (DB): نامشخص"
+        if g and g.owner_user_id:
+            owner_line = f"— مالک فعلی (DB): <a href=\"tg://user?id={g.owner_user_id}\">{g.owner_user_id}</a>"
+        txt = "👥 ادمین‌ها و مالک:\n" + "\n".join(admin_lines) + "\n" + owner_line
+        try:
+            await q.message.edit_text(txt, parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="help:home")],[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
+        except Exception:
+            pass
+        return
+    await q.answer()
     if data == "close":
         try: await q.message.delete()
         except Exception: pass
@@ -821,19 +822,19 @@ if data == "ga:admins":
                 except Exception: pass
                 return
     
-if data == "ga:wipe":
-    with SessionLocal() as s:
-        g = s.get(Group, q.message.chat.id) if q.message and q.message.chat else None
-        actor_id = update.effective_user.id
-        actor_is_owner = (actor_id == OWNER_NOTIFY_TG_ID and OWNER_NOTIFY_TG_ID != 0)
-        actor_is_seller_for_group = _is_seller_for_group(s, actor_id, g.id) if g else False
-        if not (actor_is_owner or actor_is_seller_for_group):
-            return await q.message.edit_text("اجازه نداری.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
-        if g:
-            s.query(Relationship).filter_by(chat_id=g.id).delete(synchronize_session=False)
-            s.query(Crush).filter_by(chat_id=g.id).delete(synchronize_session=False)
-            s.commit()
-    return await q.message.edit_text("🧹 پاکسازی گروه انجام شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
+    if data == "ga:wipe":
+        with SessionLocal() as s:
+            g = s.get(Group, q.message.chat.id) if q.message and q.message.chat else None
+            actor_id = update.effective_user.id
+            actor_is_owner = (actor_id == OWNER_NOTIFY_TG_ID and OWNER_NOTIFY_TG_ID != 0)
+            actor_is_seller_for_group = _is_seller_for_group(s, actor_id, g.id) if g else False
+            if not (actor_is_owner or actor_is_seller_for_group):
+                return await q.message.edit_text("اجازه نداری.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
+            if g:
+                s.query(Relationship).filter_by(chat_id=g.id).delete(synchronize_session=False)
+                s.query(Crush).filter_by(chat_id=g.id).delete(synchronize_session=False)
+                s.commit()
+        return await q.message.edit_text("🧹 پاکسازی گروه انجام شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
     if data == "ga:credit":
         with SessionLocal() as s:
             g = s.get(Group, q.message.chat.id) if q.message.chat else None
