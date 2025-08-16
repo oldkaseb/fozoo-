@@ -847,9 +847,10 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             if g.expires_at:
                 exp = g.expires_at.replace(tzinfo=dt.UTC) if g.expires_at.tzinfo is None else g.expires_at
                 if exp <= soon:
-                try:
-                    await context.bot.send_message(g.id, f"⏳ {owner_mention_html(g.owner_user_id)}اعتبار ربات کمتر از ۳ روز است.", parse_mode=constants.ParseMode.HTML)
-                except Exception: pass
+    try:
+        await context.bot.send_message(..., parse_mode=constants.ParseMode.HTML)
+    except Exception:
+        pass
             # birthdays
             users = s.query(User).filter_by(chat_id=g.id).all()
             for u in users:
