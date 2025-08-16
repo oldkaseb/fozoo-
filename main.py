@@ -221,6 +221,8 @@ def fmt_date_fa_from_greg(d: Optional[dt.date]) -> str:
 
 def fmt_dt_fa(d: Optional[dt.datetime]) -> str:
     if not d: return "-"
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.UTC)
     dl = d.astimezone(TZ_TEHRAN)
     jy,jm,jd = gregorian_to_jalali(dl.date())
     return fa_digits(f"{jy:04d}/{jm:02d}/{jd:02d} {dl.strftime('%H:%M')}")
@@ -237,7 +239,7 @@ TAG_RATE: Dict[int, dt.datetime] = {}
 TAG_COOLDOWN = dt.timedelta(seconds=120)
 
 async def get_admins_cached(context: ContextTypes.DEFAULT_TYPE, chat_id:int)->set:
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.UTC)
     c = ADMIN_CACHE.get(chat_id)
     if c and now - c[0] < ADMIN_TTL: return c[1]
     try:
@@ -273,7 +275,12 @@ def upsert_user(s, chat_id:int, tg_user: TGUser) -> User:
     return row
 
 def group_active(g: Group) -> bool:
-    return (g.expires_at is None) or (g.expires_at > dt.datetime.utcnow())
+    if g.expires_at is None:
+        return True
+    exp = g.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=dt.UTC)
+    return exp > dt.datetime.now(dt.UTC)
 
 async def create_join_button(context: ContextTypes.DEFAULT_TYPE, g: Group) -> Optional[InlineKeyboardMarkup]:
     if g.username:
@@ -365,7 +372,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as s:
             g = ensure_group(s, chat)
             if (g.trial_started_at is None) and (g.expires_at is None):
-                now = dt.datetime.utcnow()
+                now = dt.datetime.now(dt.UTC)
                 g.trial_started_at = now; g.expires_at = now + dt.timedelta(days=7); s.commit()
                 try: await context.bot.send_message(chat.id, "🎁 شروع تست رایگان ۷ روزه!")
                 except Exception: pass
@@ -577,7 +584,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 9) Tagging (rate-limited)
         if text in ("تگ پسرها","تگ پسر ها","تگ دخترها","تگ دختر ها","تگ همه"):
             if not m.reply_to_message: return await m.reply_text("روی یک پیام ریپلای کن بعد بنویس «تگ ...».")
-            last = TAG_RATE.get(g.id); now = dt.datetime.utcnow()
+            last = TAG_RATE.get(g.id); now = dt.datetime.now(dt.UTC)
             if last and now - last < TAG_COOLDOWN:
                 remain = TAG_COOLDOWN - (now - last)
                 return await m.reply_text(f"⏱ لطفاً {fa_digits(remain.seconds)} ثانیه صبر کن.")
@@ -607,7 +614,9 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mchg = re.match(r"^فضول\s*شارژ\s+(\d+)$", fa_to_en_digits(text))
             if not mchg: return await m.reply_text("مثال: فضول شارژ 1")
             days = int(mchg.group(1))
-            base = g.expires_at if (g.expires_at and g.expires_at>dt.datetime.utcnow()) else dt.datetime.utcnow()
+            now = dt.datetime.now(dt.UTC)
+            exp = g.expires_at.replace(tzinfo=dt.UTC) if (g.expires_at and g.expires_at.tzinfo is None) else g.expires_at
+            base = exp if (exp and exp>now) else now
             g.expires_at = base + dt.timedelta(days=days)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user.id, action="extend", amount_days=days)); s.commit()
             await m.reply_text(f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}")
@@ -617,7 +626,7 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in ("صفر کردن اعتبار","صفرکردن اعتبار"):
             if not (is_operator or is_admin or is_owner_of_group):
                 return await m.reply_text("اجازه نداری.")
-            g.expires_at = dt.datetime.utcnow()
+            g.expires_at = dt.datetime.now(dt.UTC)
             s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=user.id, action="zero")); s.commit()
             await m.reply_text("⏱ اعتبار صفر شد.")
             await notify_owner(context, f"[گزارش] اعتبار گروه <b>{html.escape(g.title or str(g.id))}</b> توسط <a href=\"tg://user?id={user.id}\">{user.id}</a> صفر شد.", g)
@@ -738,14 +747,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await q.message.edit_text(f"اعتبار: {fmt_dt_fa(g.expires_at)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data=f"adm:g:{gid}")],[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
             if action == "ext":
                 days = int(rest[0])
-                base = g.expires_at if (g.expires_at and g.expires_at>dt.datetime.utcnow()) else dt.datetime.utcnow()
+                now = dt.datetime.now(dt.UTC)
+            exp = g.expires_at.replace(tzinfo=dt.UTC) if (g.expires_at and g.expires_at.tzinfo is None) else g.expires_at
+            base = exp if (exp and exp>now) else now
                 g.expires_at = base + dt.timedelta(days=days)
                 s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=actor_id, action="extend", amount_days=days)); s.commit()
                 await q.message.edit_text(f"✅ تمدید شد تا {fmt_dt_fa(g.expires_at)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data=f"adm:g:{gid}")],[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
                 await notify_owner(context, f"[گزارش] گروه <b>{html.escape(g.title or str(g.id))}</b> {fa_digits(days)} روز تمدید شد.", g)
                 return
             if action == "zero":
-                g.expires_at = dt.datetime.utcnow()
+                g.expires_at = dt.datetime.now(dt.UTC)
                 s.add(SubscriptionLog(chat_id=g.id, actor_tg_user_id=actor_id, action="zero")); s.commit()
                 await q.message.edit_text("⏱ اعتبار صفر شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data=f"adm:g:{gid}")],[InlineKeyboardButton("❌ بستن", callback_data="close")]]))
                 await notify_owner(context, f"[گزارش] اعتبار گروه <b>{html.escape(g.title or str(g.id))}</b> صفر شد.", g)
@@ -828,11 +839,14 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
         groups = s.query(Group).all()
         today_g = dt.datetime.now(TZ_TEHRAN).date()
         jY,jM,jD = g2j(today_g.year, today_g.month, today_g.day)
-        soon = dt.datetime.utcnow() + dt.timedelta(days=3)
+        soon = dt.datetime.now(dt.UTC) + dt.timedelta(days=3)
         for g in groups:
-            if not group_active(g): continue
+            if not group_active(g):
+                continue
             # low credit
-            if g.expires_at and g.expires_at <= soon:
+            if g.expires_at:
+                exp = g.expires_at.replace(tzinfo=dt.UTC) if g.expires_at.tzinfo is None else g.expires_at
+                if exp <= soon:
                 try:
                     await context.bot.send_message(g.id, f"⏳ {owner_mention_html(g.owner_user_id)}اعتبار ربات کمتر از ۳ روز است.", parse_mode=constants.ParseMode.HTML)
                 except Exception: pass
