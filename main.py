@@ -313,8 +313,52 @@ def set_cfg(session: Session, key: str, value: str) -> None:
     else: cfg.value = value
     session.commit()
 
+
 async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str, html: bool = True):
+    if not OWNER_ID:
+        return
+    try:
+        with Session(engine) as s2:
+            on = get_cfg(s2, "owner_logs", "on") != "off"
+        if not on:
+            return
+        if html:
+            await context.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await context.bot.send_message(chat_id=OWNER_ID, text=text, disable_web_page_preview=True)
+    except Exception as e:
+        logger.warning(f"notify_owner failed: {e}")
+
+
 # -------- Group expiry (credit days) helpers --------
+def _gexp_key(chat_id: int) -> str:
+    return f"gexp:{chat_id}"
+
+def get_group_expiry(session: Session, group: 'Group') -> Optional[date]:
+    val = get_cfg(session, _gexp_key(group.chat_id), "")
+    if not val:
+        return None
+    try:
+        y, m, d = map(int, val.split("-"))
+        return date(y, m, d)
+    except Exception:
+        return None
+
+def set_group_expiry_days(session: Session, group: 'Group', days: int) -> date:
+    expires = now_teh().date() + timedelta(days=days)
+    set_cfg(session, _gexp_key(group.chat_id), expires.isoformat())
+    return expires
+
+def clear_group_expiry(session: Session, group: 'Group') -> None:
+    set_cfg(session, _gexp_key(group.chat_id), "")
+
+def group_remaining_days(session: Session, group: 'Group') -> int:
+    exp = get_group_expiry(session, group)
+    if not exp:
+        return 0
+    diff = (exp - now_teh().date()).days
+    return diff if diff > 0 else 0
+
 def _gexp_key(chat_id: int) -> str:
     return f"gexp:{chat_id}"
 
@@ -788,6 +832,7 @@ async def handle_panels(update, context, session, actor, text):
             f"• اعتبار گروه (روز): <b>{rem}</b>\n"
         )
 
+
 async def send_help(update, context):
     msg = (
         "راهنما (دستورات متنی):\n"
@@ -800,12 +845,13 @@ async def send_help(update, context):
         "• کراشام | (با ریپلای) کراشاش / کراشرهاش\n"
         "• (ادمین/مالک) @a رل @b | @a حذف رل @b\n"
         "• (ادمین/مالک) تگ پسرها | تگ دخترها | تگ همه (با ریپلای)\n"
-        "• (مالک/فروشنده) فضول شارژ N  (در گروه)
-• (مالک/فروشنده) فضول شارژ <chat_id> N  (از هرجا)
-• (مالک/فروشنده) فضول شارژ گروه N / فضول شارژ گروه <chat_id> N  (هر دو معتبر)
-• (مالک/فروشنده) صفر کردن اعتبار گروه  (در گروه) یا «صفر کردن اعتبار گروه <chat_id>»
-• پاکسازی داده های گروه  (در گروه) یا «پاکسازی داده های گروه <chat_id>»
-• حذف من\n"
+        "• (مالک/فروشنده) فضول شارژ N  (در گروه)\n"
+        "• (مالک/فروشنده) فضول شارژ <chat_id> N  (از هرجا)\n"
+        "• (مالک/فروشنده) فضول شارژ گروه N / فضول شارژ گروه <chat_id> N  (هر دو معتبر)\n"
+        "• (مالک/فروشنده) صفر کردن اعتبار گروه  (در گروه) یا «صفر کردن اعتبار گروه <chat_id>»\n"
+        "• پاکسازی داده های گروه  (در گروه) یا «پاکسازی داده های گروه <chat_id>»\n"
+        "• حذف من\n"
+        "• (مالک) آستانه اعتبار گروه N\n"
         "• پنل مدیریت | پنل اینجا | پنل مالک\n"
         "• پیکربندی فضول | به‌روزرسانی مدیران\n"
         "• تست سلامت: «فضول» → پاسخ «زهرمار»\n"
