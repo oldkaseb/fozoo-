@@ -8,7 +8,7 @@ import logging
 import os
 import random
 import re
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import Optional, List, Tuple
 
 from zoneinfo import ZoneInfo
@@ -314,6 +314,35 @@ def set_cfg(session: Session, key: str, value: str) -> None:
     session.commit()
 
 async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str, html: bool = True):
+# -------- Group expiry (credit days) helpers --------
+def _gexp_key(chat_id: int) -> str:
+    return f"gexp:{chat_id}"
+
+def get_group_expiry(session: Session, group: 'Group') -> Optional[date]:
+    val = get_cfg(session, _gexp_key(group.chat_id), "")
+    if not val:
+        return None
+    try:
+        y, m, d = map(int, val.split("-"))
+        return date(y, m, d)
+    except Exception:
+        return None
+
+def set_group_expiry_days(session: Session, group: 'Group', days: int) -> date:
+    expires = now_teh().date() + timedelta(days=days)
+    set_cfg(session, _gexp_key(group.chat_id), expires.isoformat())
+    return expires
+
+def clear_group_expiry(session: Session, group: 'Group') -> None:
+    set_cfg(session, _gexp_key(group.chat_id), "")
+
+def group_remaining_days(session: Session, group: 'Group') -> int:
+    exp = get_group_expiry(session, group)
+    if not exp:
+        return 0
+    diff = (exp - now_teh().date()).days
+    return diff if diff > 0 else 0
+
     if not OWNER_ID: return
     try:
         with Session(engine) as s:
@@ -355,6 +384,18 @@ PAT_SELLER_DEL = re.compile(r"^حذف\s+فروشنده\s+(@[\w_]+|\d+)$")
 PAT_SELLER_LIST = re.compile(r"^لیست\s+فروشنده‌ها$")
 # Healthcheck
 PAT_HEALTH = re.compile(r"^فضول$")
+PAT_BDAY2 = re.compile(r"^تولد\s+(\d{4}[-/]\d{1,2}[-/]\d{1,2})$")
+PAT_GROUP_CHARGE_HERE = re.compile(r"^فضول\s+شارژ\s+گروه\s+(\d+)$")
+PAT_GROUP_CHARGE_ID = re.compile(r"^فضول\s+شارژ\s+گروه\s+(-?\d+)\s+(\d+)$")
+PAT_GROUP_CHARGE_SHORT = re.compile(r"^فضول\s+شارژ\s+(\d+)$")
+PAT_GROUP_CHARGE_WITH_ID = re.compile(r"^فضول\s+شارژ\s+(-?\d+)\s+(\d+)$")
+PAT_ZERO_CREDIT_USER = re.compile(r"^صفر\s*کردن\s*اعتبار(?:\s+(@[\w_]+|\d+))?$")
+PAT_ZERO_CREDIT_GROUP_HERE = re.compile(r"^صفر\s*کردن\s*اعتبار\s*گروه$")
+PAT_ZERO_CREDIT_GROUP_ID = re.compile(r"^صفر\s*کردن\s*اعتبار\s*گروه\s+(-?\d+)$")
+PAT_GROUP_PURGE_HERE = re.compile(r"^پاکسازی\s+داده(?:\s*های)?\s+گروه$")
+PAT_GROUP_PURGE_ID = re.compile(r"^پاکسازی\s+داده(?:\s*های)?\s+گروه\s+(-?\d+)$")
+PAT_DELETE_ME = re.compile(r"^(?:حذف|حدف)\s+من$")
+PAT_SET_THRESHOLD = re.compile(r"^آستانه\s+اعتبار\s+گروه\s+(\d+)$")
 
 # -------------------- Handlers --------------------
 async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,6 +492,12 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if PAT_GENDER.match(text): await handle_gender(update, context, session, user, text)
         elif PAT_BDAY.match(text): await handle_birthday(update, context, session, user, text)
         elif PAT_IDONLY.match(text): await handle_id_info(update, context, session, user, text)
+        elif PAT_BDAY2.match(text): await handle_birthday(update, context, session, user, text.replace('تولد','ثبت تولد'))
+        elif PAT_GROUP_CHARGE_HERE.match(text) or PAT_GROUP_CHARGE_ID.match(text): await handle_group_charge(update, context, session, user, text)
+        elif PAT_ZERO_CREDIT_USER.match(text) or PAT_ZERO_CREDIT_GROUP_HERE.match(text) or PAT_ZERO_CREDIT_GROUP_ID.match(text): await handle_zero_credit(update, context, session, user, text)
+        elif PAT_GROUP_PURGE_HERE.match(text) or PAT_GROUP_PURGE_ID.match(text): await handle_group_purge(update, context, session, user, text)
+        elif PAT_DELETE_ME.match(text): await handle_delete_me(update, context, session, user)
+        elif PAT_SET_THRESHOLD.match(text): await handle_set_threshold(update, context, session, user, text)
         elif PAT_PROFILE.match(text): await handle_profile(update, context, session, user, text)
         elif PAT_REL_SET.match(text): await handle_rel_set(update, context, session, user, text)
         elif PAT_REL_DEL.match(text): await handle_rel_del(update, context, session, user, text)
@@ -459,7 +506,8 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif PAT_SHIPME.match(text): await handle_shipme(update, context, session, user, text)
         elif PAT_TAGS.match(text): await handle_tags(update, context, session, user, text)
         elif PAT_MYCRUSHES.match(text) or PAT_THEIR.match(text): await handle_crush_lists(update, context, session, user, text)
-        elif PAT_CHARGE_NEW.match(text): await handle_charge(update, context, session, user, text)
+        elif PAT_CHARGE_NEW.match(text): await handle_deprecated_user_charge(update, context)
+        elif PAT_GROUP_CHARGE_SHORT.match(text) or PAT_GROUP_CHARGE_WITH_ID.match(text) or PAT_GROUP_CHARGE_HERE.match(text) or PAT_GROUP_CHARGE_ID.match(text): await handle_group_charge(update, context, session, user, text)
         elif PAT_PANEL.match(text): await handle_panels(update, context, session, user, text)
         elif PAT_HELP.match(text): await send_help(update, context)
         elif PAT_CFG.match(text): await handle_configure(update, context, session, user, text)
@@ -715,26 +763,29 @@ async def handle_panels(update, context, session, actor, text):
         total_groups = session.scalar(select(func.count(Group.id))) or 0
         total_crushes = session.scalar(select(func.count(Crush.id))) or 0
         total_rel = session.scalar(select(func.count(Relationship.id)).where(Relationship.active==True)) or 0
-        total_credit, active_credit_users = global_credit_stats(session)
+        groups = session.execute(select(Group)).scalars().all()
+        rem_list = [group_remaining_days(session, g) for g in groups]
+        credited = sum(1 for r in rem_list if r > 0)
+        avg_rem = (sum(rem_list)/credited) if credited else 0
         return await update.message.reply_html(
             f"پنل مدیریت\n"
             f"• کاربران: <b>{total_users}</b>\n"
-            f"• گروه‌ها: <b>{total_groups}</b>\n"
+            f"• گروه‌ها: <b>{total_groups}</b> (دارای اعتبار: <b>{credited}</b>)\n"
             f"• کراش‌ها: <b>{total_crushes}</b>\n"
             f"• رِل‌های فعال: <b>{total_rel}</b>\n"
-            f"• مجموع اعتبار کاربران (روز): <b>{total_credit}</b> — کاربرانِ دارای اعتبار: <b>{active_credit_users}</b>\n"
+            f"• میانگین اعتبار گروه‌های دارای اعتبار (روز): <b>{avg_rem:.1f}</b>\n"
         )
     else:
         if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP): return await update.message.reply_text("فقط در گروه.")
         if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner_or_seller): return await update.message.reply_text("دسترسی نداری.")
         group = get_or_create_group(session, update.effective_chat)
         members = session.scalar(select(func.count(GroupMember.id)).where(GroupMember.group_id==group.id)) or 0
-        total_credit, active_users, avg_credit = group_credit_stats(session, group)
+        rem = group_remaining_days(session, group)
         return await update.message.reply_html(
             f"پنل اینجا ({group.title or group.chat_id})\n"
             f"• اعضای ثبت‌شده: <b>{members}</b>\n"
             f"• شیپ خودکار: <b>{'روشن' if group.auto_ship_enabled else 'خاموش'}</b>\n"
-            f"• اعتبار اعضا (روز): مجموع <b>{total_credit}</b> | فعال <b>{active_users}</b> | میانگین <b>{avg_credit:.1f}</b>\n"
+            f"• اعتبار گروه (روز): <b>{rem}</b>\n"
         )
 
 async def send_help(update, context):
@@ -749,7 +800,12 @@ async def send_help(update, context):
         "• کراشام | (با ریپلای) کراشاش / کراشرهاش\n"
         "• (ادمین/مالک) @a رل @b | @a حذف رل @b\n"
         "• (ادمین/مالک) تگ پسرها | تگ دخترها | تگ همه (با ریپلای)\n"
-        "• (مالک/فروشنده) فضول شارژ [@user] N\n"
+        "• (مالک/فروشنده) فضول شارژ N  (در گروه)
+• (مالک/فروشنده) فضول شارژ <chat_id> N  (از هرجا)
+• (مالک/فروشنده) فضول شارژ گروه N / فضول شارژ گروه <chat_id> N  (هر دو معتبر)
+• (مالک/فروشنده) صفر کردن اعتبار گروه  (در گروه) یا «صفر کردن اعتبار گروه <chat_id>»
+• پاکسازی داده های گروه  (در گروه) یا «پاکسازی داده های گروه <chat_id>»
+• حذف من\n"
         "• پنل مدیریت | پنل اینجا | پنل مالک\n"
         "• پیکربندی فضول | به‌روزرسانی مدیران\n"
         "• تست سلامت: «فضول» → پاسخ «زهرمار»\n"
@@ -780,6 +836,145 @@ async def handle_autoship(update, context, session, actor, text):
     group.auto_ship_enabled = onoff; session.commit()
     await update.message.reply_html(f"شیپ خودکار: <b>{'روشن' if onoff else 'خاموش'}</b>")
     await notify_owner(context, f"LOG: {hlink_for(actor)} شیپ خودکار گروه {group.title or group.chat_id} را «{'روشن' if onoff else 'خاموش'}» کرد.")
+
+
+# -------------------- Credit/Group maintenance handlers --------------------
+async def handle_group_charge(update, context, session, actor, text):
+    if not (is_owner(actor.tg_id) or actor.is_seller):
+        return await update.message.reply_text("فقط مالک یا فروشنده.")
+    # Support 4 forms: 
+    # 1) فضول شارژ گروه N (in-group)
+    # 2) فضول شارژ گروه <chat_id> N
+    # 3) فضول شارژ N (in-group)
+    # 4) فضول شارژ <chat_id> N
+    g = None; days = None
+    if PAT_GROUP_CHARGE_ID.match(text):
+        m = PAT_GROUP_CHARGE_ID.match(text); g = session.scalar(select(Group).where(Group.chat_id==int(m.group(1)))); days = int(m.group(2))
+    elif PAT_GROUP_CHARGE_HERE.match(text):
+        if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+            return await update.message.reply_text("این فرمت فقط داخل گروه قابل استفاده است.")
+        g = get_or_create_group(session, update.effective_chat); days = int(PAT_GROUP_CHARGE_HERE.match(text).group(1))
+    elif PAT_GROUP_CHARGE_WITH_ID.match(text):
+        m = PAT_GROUP_CHARGE_WITH_ID.match(text); g = session.scalar(select(Group).where(Group.chat_id==int(m.group(1)))); days = int(m.group(2))
+    elif PAT_GROUP_CHARGE_SHORT.match(text):
+        if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+            return await update.message.reply_text("برای این فرمت، شناسهٔ گروه را هم بده: «فضول شارژ <chat_id> N».")
+        g = get_or_create_group(session, update.effective_chat); days = int(PAT_GROUP_CHARGE_SHORT.match(text).group(1))
+    if not g:
+        return await update.message.reply_text("گروه پیدا نشد.")
+    exp = set_group_expiry_days(session, g, days)
+    await update.message.reply_html(
+        f"اعتبار گروه <b>{g.title or g.chat_id}</b> تا <b>{fmt_date_fa(exp)}</b> تمدید شد (باقی‌مانده: <b>{group_remaining_days(session, g)}</b> روز)."
+    )
+    await notify_owner(context, f"LOG: {hlink_for(actor)} اعتبار گروه {g.title or g.chat_id} را {days} روز شارژ کرد.")
+
+async def handle_zero_credit(update, context, session, actor, text):
+    if not (is_owner(actor.tg_id) or actor.is_seller):
+        return await update.message.reply_text("فقط مالک یا فروشنده.")
+    # Group zero
+    if PAT_ZERO_CREDIT_GROUP_ID.match(text) or (PAT_ZERO_CREDIT_GROUP_HERE.match(text) and update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)):
+        if PAT_ZERO_CREDIT_GROUP_ID.match(text):
+            chat_id = int(PAT_ZERO_CREDIT_GROUP_ID.match(text).group(1))
+            g = session.scalar(select(Group).where(Group.chat_id==chat_id))
+            if not g: return await update.message.reply_text("گروه پیدا نشد.")
+        else:
+            g = get_or_create_group(session, update.effective_chat)
+        clear_group_expiry(session, g)
+        return await update.message.reply_html(f"اعتبار گروه <b>{g.title or g.chat_id}</b> صفر شد.")
+    # User zero
+    m = PAT_ZERO_CREDIT_USER.match(text)
+    if m:
+        return await update.message.reply_text("سیستم فقط اعتبار گروه دارد. از «صفر کردن اعتبار گروه» استفاده کن.")
+    return await update.message.reply_text("فرمت نامعتبر.")
+
+async def handle_group_purge(update, context, session, actor, text):
+    # Determine target group
+    g = None
+    if PAT_GROUP_PURGE_ID.match(text):
+        if not is_owner(actor.tg_id): return await update.message.reply_text("فقط مالک می‌تواند از راه دور پاکسازی کند.")
+        chat_id = int(PAT_GROUP_PURGE_ID.match(text).group(1))
+        g = session.scalar(select(Group).where(Group.chat_id==chat_id))
+        if not g: return await update.message.reply_text("گروه پیدا نشد.")
+    else:
+        if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+            return await update.message.reply_text("این دستور باید در گروه اجرا شود یا شناسهٔ گروه را بده.")
+        # require group admin or owner
+        if not (await is_group_admin(context, update.effective_chat.id, actor.tg_id) or is_owner(actor.tg_id)):
+            return await update.message.reply_text("فقط ادمین‌های گروه یا مالک.")
+        g = get_or_create_group(session, update.effective_chat)
+    # Delete group-related data
+    session.query(GroupMember).filter(GroupMember.group_id==g.id).delete(synchronize_session=False)
+    session.query(GroupAdmin).filter(GroupAdmin.group_id==g.id).delete(synchronize_session=False)
+    session.commit()
+    join_url = await get_group_join_url(context, g.chat_id)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("ورود به گروه", url=join_url)]] if join_url else [])
+    await update.message.reply_html(f"پاکسازی داده‌های گروه <b>{g.title or g.chat_id}</b> انجام شد.", reply_markup=kb)
+    await notify_owner(context, f"LOG: پاکسازی داده‌های گروه {g.title or g.chat_id} توسط {hlink_for(get_or_create_user(session, update.effective_user))}.")
+
+async def handle_delete_me(update, context, session, actor):
+    # Remove ties
+    session.query(Crush).filter(or_(Crush.from_user_id==actor.id, Crush.to_user_id==actor.id)).delete(synchronize_session=False)
+    session.query(Relationship).filter(or_(Relationship.user1_id==actor.id, Relationship.user2_id==actor.id)).delete(synchronize_session=False)
+    session.query(GroupMember).filter(GroupMember.user_id==actor.id).delete(synchronize_session=False)
+    # Reset user fields
+    dbu = session.scalar(select(User).where(User.id==actor.id))
+    if dbu:
+        dbu.gender = "unknown"
+        dbu.birthday = None
+        dbu.avatar_file_id = None
+        dbu.snoop_credits = 0
+        session.commit()
+    await update.message.reply_text("اطلاعاتت پاک شد.")
+
+
+async def handle_deprecated_user_charge(update, context):
+    await update.message.reply_text("سیستم فقط «اعتبار گروه» دارد. از این فرمت‌ها استفاده کن:\n"
+                                    "• «فضول شارژ N» (داخل گروه)\n"
+                                    "• «فضول شارژ <chat_id> N»\n"
+                                    "• یا «فضول شارژ گروه ...»")
+
+
+# -------------------- Low-credit threshold & warnings --------------------
+async def handle_set_threshold(update, context, session, actor, text):
+    if not is_owner(actor.tg_id):
+        return await update.message.reply_text("فقط مالک.")
+    m = PAT_SET_THRESHOLD.match(text); thr = int(m.group(1))
+    if thr < 0: thr = 0
+    set_cfg(session, "lowcredit_threshold", str(thr))
+    await update.message.reply_html(f"آستانهٔ هشدار اعتبار گروه روی <b>{thr}</b> روز تنظیم شد.")
+
+async def job_check_group_credits(context: ContextTypes.DEFAULT_TYPE):
+    with Session(engine) as session:
+        try:
+            thr = int(get_cfg(session, "lowcredit_threshold", "3") or "3")
+        except Exception:
+            thr = 3
+        groups = session.execute(select(Group)).scalars().all()
+        today_iso = now_teh().date().isoformat()
+        for g in groups:
+            rem = group_remaining_days(session, g)
+            if rem <= thr:
+                # de-duplicate per day
+                key = f"gexp_lastwarn:{g.chat_id}"
+                last = get_cfg(session, key, "")
+                last_date, last_rem = (last.split("|")+["",""])[:2]
+                if last_date == today_iso and last_rem == str(rem):
+                    continue
+                msg = f"هشدار اعتبار: گروه <b>{g.title or g.chat_id}</b> — باقی‌مانده: <b>{rem}</b> روز"
+                if rem == 0:
+                    msg = f"⚠️ اعتبار گروه <b>{g.title or g.chat_id}</b> به پایان رسیده."
+                join_url = await get_group_join_url(context, g.chat_id)
+                kb = None
+                if join_url:
+                    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("ورود به گروه", url=join_url)]])
+                await notify_owner(context, msg)
+                if kb and OWNER_ID:
+                    try:
+                        await context.bot.send_message(chat_id=OWNER_ID, text="—", reply_markup=kb)
+                    except Exception:
+                        pass
+                set_cfg(session, key, f"{today_iso}|{rem}")
 
 # -------------------- OWNER PANEL (Inline Keyboard) --------------------
 def owner_menu_markup(session: Optional[Session] = None) -> InlineKeyboardMarkup:
@@ -817,7 +1012,8 @@ async def render_group_list(update_or_query, context: ContextTypes.DEFAULT_TYPE,
     for g in page_groups:
         total_credit, active_users, _ = group_credit_stats(session, g)
         status = "روشن" if g.auto_ship_enabled else "خاموش"
-        lines.append(f"• {g.title or '—'} | <code>{g.chat_id}</code> | شیپ: <b>{status}</b> | اعتبار اعضا: <b>{total_credit}</b>")
+        rem = group_remaining_days(session, g)
+        lines.append(f"• {g.title or '—'} | <code>{g.chat_id}</code> | شیپ: <b>{status}</b> | اعتبار گروه: <b>{rem}</b> روز")
         kb.append([
             InlineKeyboardButton("گزارش", callback_data=f"op:gr:{g.chat_id}:{page}"),
             InlineKeyboardButton(f"شیپ:{'خاموش' if g.auto_ship_enabled else 'روشن'}", callback_data=f"op:gtoggle:{g.chat_id}:{page}"),
@@ -867,14 +1063,19 @@ async def handle_owner_callback(update: Update, context: ContextTypes.DEFAULT_TY
             total_groups = session.scalar(select(func.count(Group.id))) or 0
             total_crushes = session.scalar(select(func.count(Crush.id))) or 0
             total_rel = session.scalar(select(func.count(Relationship.id)).where(Relationship.active==True)) or 0
-            total_credit, active_credit_users = global_credit_stats(session)
+            groups = session.execute(select(Group)).scalars().all()
+            rem_list = [group_remaining_days(session, g) for g in groups]
+            credited = sum(1 for r in rem_list if r > 0)
+            avg_rem = (sum(rem_list)/credited) if credited else 0
+            thr = int(get_cfg(session, "lowcredit_threshold", "3") or "3")
             text = (
                 "📊 گزارش سیستم\n"
                 f"• کاربران: <b>{total_users}</b>\n"
-                f"• گروه‌ها: <b>{total_groups}</b>\n"
+                f"• گروه‌ها: <b>{total_groups}</b> (دارای اعتبار: <b>{credited}</b>)\n"
                 f"• کراش‌ها: <b>{total_crushes}</b>\n"
                 f"• رِل‌های فعال: <b>{total_rel}</b>\n"
-                f"• مجموع اعتبار کاربران (روز): <b>{total_credit}</b> — کاربران دارای اعتبار: <b>{active_credit_users}</b>\n"
+                f"• میانگین اعتبار گروه‌های دارای اعتبار (روز): <b>{avg_rem:.1f}</b>\n"
+                f"• آستانهٔ هشدار اعتبار گروه: <b>{thr}</b> روز\n"
                 f"• ساعت شیپ خودکار: 18:00 تهران\n"
                 f"• ساعت تبریک تولد: 09:00 تهران\n"
             )
@@ -899,12 +1100,12 @@ async def handle_owner_callback(update: Update, context: ContextTypes.DEFAULT_TY
             female = session.scalar(select(func.count(GroupMember.id)).join(User, User.id==GroupMember.user_id).where(GroupMember.group_id==g.id, User.gender=="female")) or 0
             join_url = await get_group_join_url(context, chat_id)
             total_credit, active_users, avg_credit = group_credit_stats(session, g)
+            rem = group_remaining_days(session, g)
             text = (
-                f"گزارش گروه {g.title or chat_id}\n"
-                f"• اعضای ثبت‌شده: <b>{members}</b>\n"
+                f"گزارش گروه {g.title or chat_id}\n"                f"• اعضای ثبت‌شده: <b>{members}</b>\n"
                 f"• پسر: <b>{male}</b> | دختر: <b>{female}</b>\n"
                 f"• شیپ خودکار: <b>{'روشن' if g.auto_ship_enabled else 'خاموش'}</b>\n"
-                f"• اعتبار اعضا (روز): مجموع <b>{total_credit}</b> | فعال <b>{active_users}</b> | میانگین <b>{avg_credit:.1f}</b>\n"
+                f"• اعتبار گروه (روز): <b>{rem}</b>\n"
                 f"• آخرین فعالیت: <code>{g.last_seen_at}</code>"
             )
             kbrow1 = []
@@ -1041,6 +1242,7 @@ def build_application():
     app.add_handler(CallbackQueryHandler(handle_owner_callback, pattern=r"^op:"))
     app.job_queue.run_daily(job_daily_ship, time=time(18, 0, tzinfo=TZ))
     app.job_queue.run_daily(job_daily_birthdays, time=time(9, 0, tzinfo=TZ))
+    app.job_queue.run_daily(job_check_group_credits, time=time(10, 30, tzinfo=TZ))
     return app
 
 def main():
