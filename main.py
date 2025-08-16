@@ -1216,9 +1216,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      [[InlineKeyboardButton("بازگشت", callback_data="nav:back")]], root=False)
 
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-
-if text.startswith("فضول "):
+    if text.startswith("فضول "):
     t2 = text.split(None, 1)[1] if len(text.split())>1 else ""
     if t2 in ("اعتبار","اعتبار گروه"):
         with SessionLocal() as s:
